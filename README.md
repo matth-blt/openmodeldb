@@ -43,6 +43,11 @@ db.download(models[0], dest="./my_models/")
 # Download a specific format (pth, safetensors, onnx)
 db.download("4xNomos8k_atd_jpg", format="safetensors")
 
+# Download as ONNX with auto-conversion
+# If no ONNX file is available, downloads .pth/.safetensors and converts automatically
+db.download("4xNomos8k_atd_jpg", format="onnx")
+db.download("2x-DigitalFlim-SuperUltraCompact", format="onnx", half=True)  # FP16 export
+
 # Download all available formats
 db.download_all("4xNomos8k_atd_jpg")
 
@@ -77,6 +82,23 @@ db.interactive()
 - [InquirerPy](https://github.com/kazhala/InquirerPy) — interactive prompts
 - [rich](https://github.com/Textualize/rich) — progress bars and tables
 - [pycryptodome](https://github.com/Legrandin/pycryptodome) — Mega.nz decryption
+
+### ONNX conversion (optional)
+
+```bash
+pip install openmodeldb[onnx]
+```
+
+> **Tip:** The conversion runs on CPU only. For a lighter install (~200 MB instead of ~2 GB), install the CPU-only build of PyTorch **before** installing the extras:
+> ```bash
+> pip install torch --index-url https://download.pytorch.org/whl/cpu
+> pip install openmodeldb[onnx]
+> ```
+
+- [PyTorch](https://pytorch.org/) — model loading and ONNX export (CPU only, no GPU needed)
+- [onnx](https://github.com/onnx/onnx) — ONNX model format
+- [onnxruntime](https://github.com/microsoft/onnxruntime) — graph optimization
+- [spandrel](https://github.com/chaiNNer-org/spandrel) — universal model loader
 
 ## Credits
 

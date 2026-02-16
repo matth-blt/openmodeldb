@@ -32,7 +32,6 @@ class DownloadError(OpenModelDBError):
     """Raised when a download fails."""
 
 
-
 @dataclass
 class Model:
     """A single upscaling model from OpenModelDB."""
@@ -312,6 +311,7 @@ class OpenModelDB:
             if q in m.name.lower() or q in m.id.lower():
                 return m
         raise ModelNotFoundError(f"Model not found: '{name}'")
+    
     def get_url(self, model: Model | str, format: str | None = None) -> str:
         """
         Get the download URL for a model.
@@ -350,12 +350,28 @@ class OpenModelDB:
         available = [r.get("type", "?") for r in model.resources]
         raise FormatNotFoundError(f"Format '{fmt}' not found for {model.name}. Available: {', '.join(available)}")
 
+    def _find_convertible_resource(self, model: Model) -> dict:
+        """Find a pth or safetensors resource suitable for ONNX conversion."""
+        # Prefer pth, then safetensors
+        for preferred in ("pth", "safetensors"):
+            for res in model.resources:
+                if res.get("type", "").lower() == preferred:
+                    return res
+        # Fallback to first non-onnx resource
+        for res in model.resources:
+            if res.get("type", "").lower() != "onnx":
+                return res
+        raise FormatNotFoundError(
+            f"No PyTorch format available for {model.name} to convert to ONNX."
+        )
+
     def download(
         self,
         model: Model | str,
         dest: str | None = None,
         format: str | None = None,
         quiet: bool = False,
+        half: bool = False,
     ) -> str:
         """
         Download a model file.
@@ -364,8 +380,10 @@ class OpenModelDB:
             model: The Model to download, or a model name/id string.
             dest: Destination directory (default: ./downloads/).
             format: File format to download ('pth', 'safetensors', 'onnx').
-                    Default: first available.
+                    If 'onnx' is requested but not available, downloads
+                    a PyTorch format and converts automatically.
             quiet: If True, download silently (no prints or progress bar).
+            half: If True and converting to ONNX, export in FP16 instead of FP32.
 
         Returns:
             Path to the downloaded file.
@@ -377,7 +395,17 @@ class OpenModelDB:
             model = self._resolve_model(model)
 
         dest_dir = dest or self._download_dir
-        res = self._find_resource(model, format)
+        need_onnx_convert = False
+
+        try:
+            res = self._find_resource(model, format)
+        except FormatNotFoundError:
+            if format and format.lower().lstrip(".") == "onnx":
+                # ONNX not available — download a PyTorch format and convert
+                res = self._find_convertible_resource(model)
+                need_onnx_convert = True
+            else:
+                raise
 
         urls = res.get("urls", [])
         if not urls:
@@ -386,9 +414,51 @@ class OpenModelDB:
         dl_url = pick_best_url(urls)
         file_ext = res.get("type", "pth")
         file_name = build_filename(dl_url, model.id, file_ext)
+
+        if need_onnx_convert:
+            # Download the intermediate PyTorch file into the cache directory
+            cache_path = os.path.join(self._cache_dir, file_name)
+            # Final ONNX goes into the destination directory
+            onnx_name = os.path.splitext(file_name)[0]
+            onnx_path = os.path.join(dest_dir, f"{onnx_name}.onnx")
+
+            if os.path.exists(onnx_path):
+                if not quiet:
+                    print(f"  \033[92m✓\033[0m \033[1m{model.name}\033[0m ONNX already exists \033[2m({onnx_path})\033[0m")
+                return onnx_path
+
+            if not quiet:
+                print(f"  Downloading \033[1m{model.name}\033[0m by {model.author} ({model.architecture}, {model.scale}x) [{file_ext}] → ONNX conversion")
+
+            # Download to cache (may already be cached)
+            if not os.path.exists(cache_path):
+                smart_download(dl_url, cache_path, quiet=quiet)
+            elif not quiet:
+                print(f"  Using cached \033[2m{cache_path}\033[0m")
+
+            # Convert to ONNX
+            from openmodeldb.converter import convert_to_onnx
+
+            onnx_path = convert_to_onnx(
+                model_path=cache_path,
+                output_path=onnx_path,
+                half=half,
+                quiet=quiet,
+            )
+
+            # Clean up the cached PyTorch file
+            try:
+                os.remove(cache_path)
+            except OSError:
+                pass
+
+            if not quiet:
+                print()
+            return onnx_path
+
+        # Normal (non-convert) download
         file_path = os.path.join(dest_dir, file_name)
 
-        # Skip if already downloaded
         if os.path.exists(file_path):
             if not quiet:
                 print(f"  \033[92m✓\033[0m \033[1m{model.name}\033[0m already exists \033[2m({file_path})\033[0m")

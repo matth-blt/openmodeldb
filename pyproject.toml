@@ -30,6 +30,13 @@ dependencies = [
 
 [project.optional-dependencies]
 mediafire = ["mediafiredl>=0.0.2"]
+onnx = [
+    "torch>=2.0",
+    "onnx>=1.14",
+    "onnxruntime>=1.15",
+    "spandrel>=0.3",
+    "spandrel-extra-arches",
+]
 
 [project.scripts]
 openmodeldb = "openmodeldb.cli:main"
