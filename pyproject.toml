@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openmodeldb"
+version = "1.0.0"
+description = "Browse and download AI upscaling models from OpenModelDB"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+keywords = ["upscaling", "ai", "esrgan", "super-resolution", "openmodeldb"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Image Processing",
+]
+dependencies = [
+    "InquirerPy>=0.3.4",
+    "pycryptodome>=3.18.0",
+    "rich>=13.0.0",
+]
+
+[project.optional-dependencies]
+mediafire = ["mediafiredl>=0.0.2"]
+
+[project.scripts]
+openmodeldb = "openmodeldb.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/openmodeldb-cli/openmodeldb"
+Source = "https://github.com/openmodeldb-cli/openmodeldb"
+
+[tool.setuptools.packages.find]
+include = ["openmodeldb*"]
