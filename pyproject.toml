@@ -36,8 +36,8 @@ mediafire = ["mediafiredl>=0.0.2"]
 openmodeldb = "openmodeldb.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/openmodeldb-cli/openmodeldb"
-Source = "https://github.com/openmodeldb-cli/openmodeldb"
+Homepage = "https://github.com/matth-blt/openmodeldb"
+Source = "https://github.com/matth-blt/openmodeldb"
 
 [tool.setuptools.packages.find]
 include = ["openmodeldb*"]
