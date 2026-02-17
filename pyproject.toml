@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "openmodeldb"
-version = "1.0.0"
+version = "1.1.0"
 description = "Browse and download AI upscaling models from OpenModelDB"
 readme = "README.md"
 license = "MIT"
@@ -30,6 +30,14 @@ dependencies = [
 
 [project.optional-dependencies]
 mediafire = ["mediafiredl>=0.0.2"]
+convert = [
+    "torch>=2.0",
+    "safetensors>=0.3",
+    "onnx>=1.14",
+    "onnxruntime>=1.15",
+    "spandrel>=0.3",
+    "spandrel-extra-arches",
+]
 
 [project.scripts]
 openmodeldb = "openmodeldb.cli:main"
