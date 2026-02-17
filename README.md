@@ -43,6 +43,11 @@ db.download(models[0], dest="./my_models/")
 # Download a specific format (pth, safetensors, onnx)
 db.download("4xNomos8k_atd_jpg", format="safetensors")
 
+# Auto-conversion between pth and safetensors
+# If the requested format is unavailable, downloads the other and converts
+db.download("2x-HFA2kAVCCompact", format="safetensors")  # only pth available → auto-convert
+db.download("1x-SuperScale", format="pth")                # only safetensors → auto-convert
+
 # Download as ONNX with auto-conversion
 # If no ONNX file is available, downloads .pth/.safetensors and converts automatically
 db.download("4xNomos8k_atd_jpg", format="onnx")
@@ -50,6 +55,11 @@ db.download("2x-DigitalFlim-SuperUltraCompact", format="onnx", half=True)  # FP1
 
 # Download all available formats
 db.download_all("4xNomos8k_atd_jpg")
+db.download_all("4xNomos8k_atd_jpg", format="pth")  # only .pth files
+
+# Verify model integrity (compare weights against database reference)
+db.test_integrity("downloads/4xNomos8k_atd_jpg.pth")
+# ✓ PASS  similarity=100.000000  matched=53/53  max_diff=0.00e+00  mean_diff=0.00e+00
 
 # Silent mode (no output, for use as a library)
 path = db.download("4xNomos8k_atd_jpg", quiet=True)
@@ -83,19 +93,16 @@ db.interactive()
 - [rich](https://github.com/Textualize/rich) — progress bars and tables
 - [pycryptodome](https://github.com/Legrandin/pycryptodome) — Mega.nz decryption
 
-### ONNX conversion (optional)
+### Conversion (optional)
 
 ```bash
-pip install openmodeldb[onnx]
+pip install openmodeldb[convert]
 ```
 
-> **Tip:** The conversion runs on CPU only. For a lighter install (~200 MB instead of ~2 GB), install the CPU-only build of PyTorch **before** installing the extras:
-> ```bash
-> pip install torch --index-url https://download.pytorch.org/whl/cpu
-> pip install openmodeldb[onnx]
-> ```
+Enables automatic conversion between formats: pth ↔ safetensors ↔ ONNX.
 
-- [PyTorch](https://pytorch.org/) — model loading and ONNX export (CPU only, no GPU needed)
+- [PyTorch](https://pytorch.org/) — model loading and ONNX export
+- [safetensors](https://github.com/huggingface/safetensors) — safe tensor serialization
 - [onnx](https://github.com/onnx/onnx) — ONNX model format
 - [onnxruntime](https://github.com/microsoft/onnxruntime) — graph optimization
 - [spandrel](https://github.com/chaiNNer-org/spandrel) — universal model loader

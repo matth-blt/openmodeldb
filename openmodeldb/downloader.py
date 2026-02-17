@@ -21,7 +21,7 @@ from rich.progress import (
 
 def _download_with_progress(resp, dest: str, total: int | None = None, transform=None, quiet: bool = False):
     """Download response to file with optional rich progress bar.
-    
+
     Args:
         resp: HTTP response object.
         dest: Destination file path.

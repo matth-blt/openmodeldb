@@ -1,8 +1,8 @@
 """
-ONNX conversion utilities for OpenModelDB.
+Conversion utilities for OpenModelDB.
 
-Converts PyTorch (.pth / .safetensors) models to ONNX format
-using spandrel for model loading and torch.onnx for export.
+- pth ↔ safetensors: state_dict re-serialization
+- pth / safetensors → ONNX: spandrel + torch.onnx.export
 """
 
 import os
@@ -31,7 +31,7 @@ def _check_dependencies():
     if missing:
         raise ImportError(
             f"ONNX conversion requires additional packages: {', '.join(missing)}. "
-            f"Install them with: pip install openmodeldb[onnx]"
+            f"Install them with: pip install openmodeldb[convert]"
         )
 
 
@@ -42,6 +42,213 @@ def _make_progress(quiet: bool):
         return nullcontext()
     from rich.console import Console
     return Console().status("", spinner="dots")
+
+
+def convert_format(
+    model_path: str,
+    output_path: str | None = None,
+    target: str = "safetensors",
+    quiet: bool = False,
+) -> str:
+    """
+    Convert between pth and safetensors formats.
+
+    Args:
+        model_path: Path to the source model file (.pth or .safetensors).
+        output_path: Path for the output file.
+                     If None, replaces the extension automatically.
+        target: Target format ("safetensors" or "pth").
+        quiet: If True, suppress all output.
+
+    Returns:
+        Path to the converted file.
+    """
+    try:
+        import torch
+    except ImportError:
+        raise ImportError("torch is required for format conversion. pip install torch")
+
+    target = target.lower().lstrip(".")
+    base_name = os.path.basename(model_path)
+
+    if output_path is None:
+        base = os.path.splitext(model_path)[0]
+        output_path = f"{base}.{target}"
+
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+
+    status = _make_progress(quiet)
+    with status:
+        if not quiet:
+            status.update(f"  Loading {base_name}...")
+
+        # Load state dict
+        src_ext = os.path.splitext(model_path)[1].lower()
+        if src_ext == ".safetensors":
+            try:
+                from safetensors.torch import load_file
+            except ImportError:
+                raise ImportError("safetensors is required. pip install safetensors")
+            state_dict = load_file(model_path, device="cpu")
+        else:
+            try:
+                state_dict = torch.load(model_path, map_location="cpu", weights_only=True)
+            except Exception:
+                state_dict = torch.load(model_path, map_location="cpu", weights_only=False)
+            # Handle nested state dicts (e.g. {"state_dict": {...}, "params_ema": {...}})
+            if isinstance(state_dict, dict):
+                for key in ("params_ema", "params", "state_dict", "model", "model_state_dict"):
+                    if key in state_dict and isinstance(state_dict[key], dict):
+                        state_dict = state_dict[key]
+                        break
+
+        if not quiet:
+            status.update(f"  Converting to {target}...")
+
+        start = time.time()
+
+        # Save in target format
+        if target == "safetensors":
+            try:
+                from safetensors.torch import save_file
+            except ImportError:
+                raise ImportError("safetensors is required. pip install safetensors")
+            save_file(state_dict, output_path)
+        else:
+            torch.save(state_dict, output_path)
+
+        elapsed = time.time() - start
+
+    if not quiet:
+        size_mb = os.path.getsize(output_path) / 1048576
+        print(
+            f"  \033[92m✓\033[0m Converted to {target} \033[2m{output_path}\033[0m"
+            f" ({size_mb:.1f} MB, {elapsed:.1f}s)"
+        )
+
+    return output_path
+
+
+def compare_weights(
+    path_a: str,
+    path_b: str,
+    quiet: bool = False,
+) -> dict:
+    """
+    Compare weights between two model files (pth, safetensors, or onnx).
+
+    Returns a dict with:
+        - matched: number of matched tensor names
+        - total_a / total_b: tensor counts
+        - max_diff: worst-case absolute difference
+        - mean_diff: average absolute difference
+        - identical: True when max_diff == 0
+        - similarity: percentage (100.0 = identical)
+    """
+    try:
+        import torch
+    except ImportError:
+        raise ImportError("torch is required for weight comparison. pip install torch")
+
+    def _load(path: str) -> dict[str, "torch.Tensor"]:
+        ext = os.path.splitext(path)[1].lower()
+        if ext == ".safetensors":
+            from safetensors.torch import load_file
+            return load_file(path, device="cpu")
+        if ext == ".onnx":
+            import onnx
+            from onnx import numpy_helper
+            model = onnx.load(path)
+            return {
+                init.name: torch.from_numpy(numpy_helper.to_array(init))
+                for init in model.graph.initializer
+            }
+        try:
+            sd = torch.load(path, map_location="cpu", weights_only=True)
+        except Exception:
+            sd = torch.load(path, map_location="cpu", weights_only=False)
+        if isinstance(sd, dict):
+            for key in ("params_ema", "params", "state_dict", "model", "model_state_dict"):
+                if key in sd and isinstance(sd[key], dict):
+                    sd = sd[key]
+                    break
+        return sd
+
+    weights_a = _load(path_a)
+    weights_b = _load(path_b)
+
+    common = set(weights_a.keys()) & set(weights_b.keys())
+    if not common:
+        # No shared keys — try matching by shape (ONNX renames layers)
+        by_shape_a = {}
+        for k, v in weights_a.items():
+            key = (tuple(v.shape), v.dtype)
+            by_shape_a.setdefault(key, []).append((k, v))
+        by_shape_b = {}
+        for k, v in weights_b.items():
+            key = (tuple(v.shape), v.dtype)
+            by_shape_b.setdefault(key, []).append((k, v))
+
+        max_diff = 0.0
+        total_diff = 0.0
+        count = 0
+        for key in by_shape_a:
+            if key in by_shape_b:
+                for (_, va), (_, vb) in zip(by_shape_a[key], by_shape_b[key]):
+                    diff = (va.float() - vb.float()).abs()
+                    md = diff.max().item()
+                    max_diff = max(max_diff, md)
+                    total_diff += diff.mean().item()
+                    count += 1
+
+        if count == 0:
+            return {
+                "matched": 0,
+                "total_a": len(weights_a),
+                "total_b": len(weights_b),
+                "max_diff": float("inf"),
+                "mean_diff": float("inf"),
+                "identical": False,
+                "similarity": 0.0,
+            }
+
+        mean_diff = total_diff / count
+        similarity = max(0.0, 100.0 * (1.0 - mean_diff))
+        return {
+            "matched": count,
+            "total_a": len(weights_a),
+            "total_b": len(weights_b),
+            "max_diff": max_diff,
+            "mean_diff": mean_diff,
+            "identical": max_diff == 0.0,
+            "similarity": round(similarity, 4),
+        }
+
+    max_diff = 0.0
+    total_diff = 0.0
+    for name in common:
+        a = weights_a[name].float()
+        b = weights_b[name].float()
+        if a.shape != b.shape:
+            continue
+        diff = (a - b).abs()
+        md = diff.max().item()
+        max_diff = max(max_diff, md)
+        total_diff += diff.mean().item()
+
+    n = len(common) or 1
+    mean_diff = total_diff / n
+    similarity = max(0.0, 100.0 * (1.0 - mean_diff))
+
+    return {
+        "matched": len(common),
+        "total_a": len(weights_a),
+        "total_b": len(weights_b),
+        "max_diff": max_diff,
+        "mean_diff": mean_diff,
+        "identical": max_diff == 0.0,
+        "similarity": round(similarity, 4),
+    }
 
 
 def convert_to_onnx(
