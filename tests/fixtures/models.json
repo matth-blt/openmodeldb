@@ -1,0 +1,126 @@
+{
+  "4x-ExamplePth": {
+    "name": "ExampleNet Pth",
+    "author": "alice",
+    "architecture": "esrgan",
+    "scale": 4,
+    "license": "CC0",
+    "tags": ["photo", "denoise"],
+    "description": "A photo denoising upscaler",
+    "resources": [
+      {
+        "platform": "pytorch",
+        "type": "pth",
+        "size": 12345678,
+        "urls": ["https://github.com/alice/example/releases/download/v1/examplenet.pth"]
+      }
+    ]
+  },
+  "2x-SafeOnly": {
+    "name": "SafeOnly Net",
+    "author": "bob",
+    "architecture": "compact",
+    "scale": 2,
+    "license": "MIT",
+    "tags": ["anime"],
+    "description": "Anime upscaler, safetensors only",
+    "resources": [
+      {
+        "platform": "pytorch",
+        "type": "safetensors",
+        "size": 5000000,
+        "urls": ["https://huggingface.co/bob/safeonly/resolve/main/safeonly.safetensors"]
+      }
+    ]
+  },
+  "4x-DualFormat": {
+    "name": "DualFormat Net",
+    "author": "carol",
+    "architecture": "span",
+    "scale": 4,
+    "license": "Apache-2.0",
+    "tags": ["photo", "sharp"],
+    "description": "Ships both onnx and pth resources",
+    "resources": [
+      {
+        "platform": "pytorch",
+        "type": "onnx",
+        "size": 2000000,
+        "urls": ["https://huggingface.co/carol/dual/resolve/main/dual.onnx"]
+      },
+      {
+        "platform": "pytorch",
+        "type": "pth",
+        "size": 4000000,
+        "urls": ["https://huggingface.co/carol/dual/resolve/main/dual.pth"]
+      }
+    ]
+  },
+  "4x-ZipArchive": {
+    "name": "ZipArchive Net",
+    "author": "dave",
+    "architecture": "esrgan",
+    "scale": 4,
+    "license": "MIT",
+    "tags": ["archive"],
+    "description": "Model shipped inside a zip archive",
+    "resources": [
+      {
+        "platform": "pytorch",
+        "type": "pth",
+        "size": 9999999,
+        "urls": ["https://github.com/dave/ziparchive/releases/download/v1/ziparchive.zip"]
+      }
+    ]
+  },
+  "4x-ListAuthor": {
+    "name": "ListAuthor Net",
+    "author": ["erin", "frank"],
+    "architecture": "compact",
+    "scale": 4,
+    "license": "MIT",
+    "tags": ["denoise"],
+    "description": "Model credited to multiple authors",
+    "resources": [
+      {
+        "platform": "pytorch",
+        "type": "pth",
+        "size": 1234567,
+        "urls": ["https://huggingface.co/erin/listauthor/resolve/main/listauthor.pth"]
+      }
+    ]
+  },
+  "cain-excluded-model": {
+    "name": "Cain Excluded",
+    "author": "grace",
+    "architecture": "cain",
+    "scale": 2,
+    "license": "MIT",
+    "tags": ["frame-interpolation"],
+    "description": "Frame interpolation model, must be excluded by the client",
+    "resources": [
+      {
+        "platform": "pytorch",
+        "type": "pth",
+        "size": 1000,
+        "urls": ["https://example.com/cain.pth"]
+      }
+    ]
+  },
+  "2x-NoScale": {
+    "name": "NoScale Net",
+    "author": "heidi",
+    "architecture": "esrgan",
+    "license": "MIT",
+    "tags": ["photo"],
+    "description": "Entry missing the scale field entirely",
+    "resources": [
+      {
+        "platform": "pytorch",
+        "type": "pth",
+        "size": 333333,
+        "urls": ["https://mega.nz/file/abc123#key456"]
+      }
+    ]
+  }
+}

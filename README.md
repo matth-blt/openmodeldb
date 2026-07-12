@@ -1,6 +1,16 @@
 # OpenModelDB
 
+[![CI](https://github.com/matth-blt/openmodeldb/actions/workflows/ci.yml/badge.svg)](https://github.com/matth-blt/openmodeldb/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/openmodeldb)](https://pypi.org/project/openmodeldb/)
+[![Python](https://img.shields.io/pypi/pyversions/openmodeldb)](https://pypi.org/project/openmodeldb/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 Browse and download AI upscaling models from [OpenModelDB](https://openmodeldb.info).
+
+- **Browse** — search and filter 650+ super-resolution models by scale, architecture, or tag
+- **Download** — from any host (direct, GitHub, Hugging Face, Google Drive, MediaFire, Mega.nz), with atomic writes and resume-safe caching
+- **Convert** — automatic pth ↔ safetensors ↔ ONNX conversion when the requested format isn't published
+- **Verify** — compare a local file's weights against the database reference
 
 ## Install
 
@@ -11,10 +21,14 @@ pip install openmodeldb
 ## CLI
 
 ```bash
-openmodeldb
-```
+openmodeldb                    # interactive: select scale → pick a model → download
 
-Select scale → pick a model → download.
+openmodeldb list [--scale N] [--arch ARCH] [--tag TAG]
+openmodeldb search QUERY
+openmodeldb download NAME [--format FMT] [--dest DIR] [--half] [--all]
+openmodeldb check FILE         # verify a local file against the reference
+openmodeldb --version
+```
 
 ## Python API
 
@@ -87,11 +101,54 @@ for model in db:
 db.interactive()
 ```
 
+### Options
+
+```python
+db = OpenModelDB(
+    cache_dir="/path/to/cache",   # model index + temp files (default: ~/.cache/openmodeldb)
+    download_dir="./my_models",   # default destination for downloads (default: ./downloads)
+    include_all=True,             # include archs excluded by default (cain, cain-yuv)
+)
+
+db.download_dir      # resolved download directory
+db.cache_dir         # resolved cache directory
+db.cache_is_valid()  # True if the cached index is fresh (< 1 hour)
+
+db.refresh()      # force re-fetch of the model index from the API
+db.clear_cache()  # delete the cached index
+```
+
+The model index is cached for 1 hour (with ETag revalidation). If the API is
+unreachable, the client falls back to the stale cache with a warning on stderr.
+
+### Error handling
+
+All errors inherit from `OpenModelDBError`:
+
+```python
+from openmodeldb import (
+    OpenModelDBError,      # base — also raised when the API is unreachable with no cache
+    ModelNotFoundError,    # unknown or ambiguous model name
+    FormatNotFoundError,   # requested format unavailable (and not convertible)
+    DownloadError,         # network/host failure during download
+)
+
+try:
+    db.download("4xNomos8k_atd_jpg", format="onnx")
+except OpenModelDBError as e:
+    print(f"failed: {e}")
+```
+
+Name resolution is strict: an exact id/name match wins, a unique partial match
+is accepted, and an ambiguous partial match raises `ModelNotFoundError` listing
+the candidates.
+
 ## Dependencies
 
 - [InquirerPy](https://github.com/kazhala/InquirerPy) — interactive prompts
 - [rich](https://github.com/Textualize/rich) — progress bars and tables
 - [pycryptodome](https://github.com/Legrandin/pycryptodome) — Mega.nz decryption
+- [mediafiredl](https://github.com/Gann4/mediafiredl) — MediaFire direct-link extraction
 
 ### Conversion (optional)
 
@@ -106,6 +163,20 @@ Enables automatic conversion between formats: pth ↔ safetensors ↔ ONNX.
 - [onnx](https://github.com/onnx/onnx) — ONNX model format
 - [onnxruntime](https://github.com/microsoft/onnxruntime) — graph optimization
 - [spandrel](https://github.com/chaiNNer-org/spandrel) — universal model loader
+
+## Development
+
+```bash
+git clone https://github.com/matth-blt/openmodeldb
+cd openmodeldb
+pip install -e .[dev]
+
+python -m pytest tests/ -q   # run the test suite (offline, no network needed)
+ruff check .                 # lint
+```
+
+Tests covering format conversion require the `convert` extras
+(`pip install -e .[dev,convert]`) and are skipped automatically without them.
 
 ## Credits
 

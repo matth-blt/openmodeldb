@@ -10,12 +10,12 @@ Usage:
 """
 
 from openmodeldb.client import (
-    OpenModelDB,
-    Model,
-    OpenModelDBError,
-    ModelNotFoundError,
-    FormatNotFoundError,
     DownloadError,
+    FormatNotFoundError,
+    Model,
+    ModelNotFoundError,
+    OpenModelDB,
+    OpenModelDBError,
 )
 
 __all__ = [
@@ -26,4 +26,4 @@ __all__ = [
     "FormatNotFoundError",
     "DownloadError",
 ]
-__version__ = "1.0.0"
+__version__ = "1.1.1"

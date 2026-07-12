@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "openmodeldb"
-version = "1.1.1"
+dynamic = ["version"]
 description = "Browse and download AI upscaling models from OpenModelDB"
 readme = "README.md"
 license = "MIT"
@@ -38,6 +38,7 @@ convert = [
     "spandrel>=0.3",
     "spandrel-extra-arches",
 ]
+dev = ["pytest>=8", "ruff>=0.4"]
 
 [project.scripts]
 openmodeldb = "openmodeldb.cli:main"
@@ -46,6 +47,19 @@ openmodeldb = "openmodeldb.cli:main"
 Homepage = "https://github.com/matth-blt/openmodeldb"
 Source = "https://github.com/matth-blt/openmodeldb"
 
+[tool.setuptools.dynamic]
+version = {attr = "openmodeldb.__version__"}
+
 [tool.setuptools.packages.find]
 include = ["openmodeldb*"]
+
+[tool.setuptools.package-data]
+openmodeldb = ["py.typed"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
 

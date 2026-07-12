@@ -13,19 +13,19 @@ def _check_dependencies():
     """Check that ONNX conversion dependencies are installed."""
     missing = []
     try:
-        import torch
+        import torch  # noqa: F401
     except ImportError:
         missing.append("torch")
     try:
-        import onnx
+        import onnx  # noqa: F401
     except ImportError:
         missing.append("onnx")
     try:
-        import onnxruntime
+        import onnxruntime  # noqa: F401
     except ImportError:
         missing.append("onnxruntime")
     try:
-        import spandrel
+        import spandrel  # noqa: F401
     except ImportError:
         missing.append("spandrel")
     if missing:
@@ -94,6 +94,12 @@ def convert_format(
             try:
                 state_dict = torch.load(model_path, map_location="cpu", weights_only=True)
             except Exception:
+                import warnings
+                warnings.warn(
+                    f"{model_path}: falling back to unsafe pickle load (weights_only=False); "
+                    f"only do this for files you trust",
+                    UserWarning,
+                )
                 state_dict = torch.load(model_path, map_location="cpu", weights_only=False)
             # Handle nested state dicts (e.g. {"state_dict": {...}, "params_ema": {...}})
             if isinstance(state_dict, dict):
@@ -142,8 +148,9 @@ def compare_weights(
         - total_a / total_b: tensor counts
         - max_diff: worst-case absolute difference
         - mean_diff: average absolute difference
+        - mean_rel_diff: average difference relative to the magnitude of path_b's weights
         - identical: True when max_diff == 0
-        - similarity: percentage (100.0 = identical)
+        - similarity: percentage (100.0 = identical), based on mean_rel_diff
     """
     try:
         import torch
@@ -166,6 +173,12 @@ def compare_weights(
         try:
             sd = torch.load(path, map_location="cpu", weights_only=True)
         except Exception:
+            import warnings
+            warnings.warn(
+                f"{path}: falling back to unsafe pickle load (weights_only=False); "
+                f"only do this for files you trust",
+                UserWarning,
+            )
             sd = torch.load(path, map_location="cpu", weights_only=False)
         if isinstance(sd, dict):
             for key in ("params_ema", "params", "state_dict", "model", "model_state_dict"):
@@ -191,14 +204,19 @@ def compare_weights(
 
         max_diff = 0.0
         total_diff = 0.0
+        total_rel_diff = 0.0
         count = 0
         for key in by_shape_a:
             if key in by_shape_b:
                 for (_, va), (_, vb) in zip(by_shape_a[key], by_shape_b[key]):
-                    diff = (va.float() - vb.float()).abs()
+                    vaf = va.float()
+                    vbf = vb.float()
+                    diff = (vaf - vbf).abs()
                     md = diff.max().item()
                     max_diff = max(max_diff, md)
                     total_diff += diff.mean().item()
+                    rel = diff.mean().item() / (vbf.abs().mean().item() + 1e-12)
+                    total_rel_diff += rel
                     count += 1
 
         if count == 0:
@@ -208,24 +226,28 @@ def compare_weights(
                 "total_b": len(weights_b),
                 "max_diff": float("inf"),
                 "mean_diff": float("inf"),
+                "mean_rel_diff": float("inf"),
                 "identical": False,
                 "similarity": 0.0,
             }
 
         mean_diff = total_diff / count
-        similarity = max(0.0, 100.0 * (1.0 - mean_diff))
+        mean_rel_diff = total_rel_diff / count
+        similarity = max(0.0, 100.0 * (1.0 - mean_rel_diff))
         return {
             "matched": count,
             "total_a": len(weights_a),
             "total_b": len(weights_b),
             "max_diff": max_diff,
             "mean_diff": mean_diff,
+            "mean_rel_diff": mean_rel_diff,
             "identical": max_diff == 0.0,
             "similarity": round(similarity, 4),
         }
 
     max_diff = 0.0
     total_diff = 0.0
+    total_rel_diff = 0.0
     for name in common:
         a = weights_a[name].float()
         b = weights_b[name].float()
@@ -234,11 +256,14 @@ def compare_weights(
         diff = (a - b).abs()
         md = diff.max().item()
         max_diff = max(max_diff, md)
-        total_diff += diff.mean().item()
+        diff_mean = diff.mean().item()
+        total_diff += diff_mean
+        total_rel_diff += diff_mean / (b.abs().mean().item() + 1e-12)
 
     n = len(common) or 1
     mean_diff = total_diff / n
-    similarity = max(0.0, 100.0 * (1.0 - mean_diff))
+    mean_rel_diff = total_rel_diff / n
+    similarity = max(0.0, 100.0 * (1.0 - mean_rel_diff))
 
     return {
         "matched": len(common),
@@ -246,6 +271,7 @@ def compare_weights(
         "total_b": len(weights_b),
         "max_diff": max_diff,
         "mean_diff": mean_diff,
+        "mean_rel_diff": mean_rel_diff,
         "identical": max_diff == 0.0,
         "similarity": round(similarity, 4),
     }
@@ -277,12 +303,12 @@ def convert_to_onnx(
     _check_dependencies()
 
     import io
-    import sys
     import warnings
+    from contextlib import redirect_stderr, redirect_stdout
 
-    import torch
     import onnxruntime as ort
-    from spandrel import ModelLoader, ImageModelDescriptor
+    import torch
+    from spandrel import ImageModelDescriptor, ModelLoader
 
     precision = "FP16" if half else "FP32"
     base_name = os.path.basename(model_path)
@@ -301,14 +327,9 @@ def convert_to_onnx(
             pass
 
         # Suppress spandrel's verbose weight dump during loading
-        _old_stdout, _old_stderr = sys.stdout, sys.stderr
-        sys.stdout = io.StringIO()
-        sys.stderr = io.StringIO()
-        try:
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
             loader = ModelLoader()
             model_desc = loader.load_from_file(model_path)
-        finally:
-            sys.stdout, sys.stderr = _old_stdout, _old_stderr
 
         assert isinstance(model_desc, ImageModelDescriptor), (
             f"Unsupported model type: expected ImageModelDescriptor, got {type(model_desc).__name__}"
@@ -366,23 +387,32 @@ def convert_to_onnx(
         # Patch torch.sort ONNX symbolic: the built-in handler wrongly
         # treats the `stable` kwarg as the `out` parameter and rejects it.
         # We monkey-patch _sort_helper to ignore `out` and just do TopK.
+        # `_sort_helper` is a private torch API and may be renamed/removed in
+        # future torch releases — guard the patch so export still proceeds
+        # (unpatched) if it's gone.
         from torch.onnx import symbolic_helper as _sh
 
-        _orig_sort_helper = _sh._sort_helper
+        _sort_helper_patched = False
+        try:
+            _orig_sort_helper = _sh._sort_helper
+            _sort_helper_patched = True
+        except AttributeError:
+            pass
 
-        def _patched_sort_helper(g, input, dim, decending=True, out=None):
-            shape_ = g.op("Shape", input)
-            dim_size_ = g.op(
-                "Gather",
-                shape_,
-                g.op("Constant", value_t=torch.tensor([dim], dtype=torch.int64)),
-            )
-            return g.op(
-                "TopK", input, dim_size_,
-                axis_i=dim, largest_i=decending, outputs=2,
-            )
+        if _sort_helper_patched:
+            def _patched_sort_helper(g, input, dim, decending=True, out=None):
+                shape_ = g.op("Shape", input)
+                dim_size_ = g.op(
+                    "Gather",
+                    shape_,
+                    g.op("Constant", value_t=torch.tensor([dim], dtype=torch.int64)),
+                )
+                return g.op(
+                    "TopK", input, dim_size_,
+                    axis_i=dim, largest_i=decending, outputs=2,
+                )
 
-        _sh._sort_helper = _patched_sort_helper
+            _sh._sort_helper = _patched_sort_helper
 
         try:
             torch.onnx.export(
@@ -400,8 +430,9 @@ def convert_to_onnx(
                 output_names=["output"],
             )
         finally:
-            # Restore original sort helper
-            _sh._sort_helper = _orig_sort_helper
+            if _sort_helper_patched:
+                # Restore original sort helper
+                _sh._sort_helper = _orig_sort_helper
 
         export_time = time.time() - start
 

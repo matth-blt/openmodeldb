@@ -3,33 +3,31 @@ OpenModelDB Client — core API for fetching and querying models.
 """
 from __future__ import annotations
 
+import http.client
 import json
 import os
+import sys
 import time
+import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 
+# Exceptions live in openmodeldb.exceptions; re-imported here so existing
+# code doing `from openmodeldb.client import DownloadError` (etc.) keeps
+# working.
+from openmodeldb.downloader import USER_AGENT
+from openmodeldb.exceptions import (
+    DownloadError,
+    FormatNotFoundError,
+    ModelNotFoundError,
+    OpenModelDBError,
+)
 
 API_URL = "https://openmodeldb.info/api/v1/models.json"
 DEFAULT_CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "openmodeldb")
 DEFAULT_DOWNLOAD_DIR = os.path.join(os.getcwd(), "downloads")
 CACHE_MAX_AGE = 3600
 EXCLUDED_ARCHS = {"cain", "cain-yuv"}
-
-
-# ─── Exceptions ──────────────────────────────────────────────────────────
-
-class OpenModelDBError(Exception):
-    """Base exception for OpenModelDB."""
-
-class ModelNotFoundError(OpenModelDBError):
-    """Raised when a model name/id cannot be resolved."""
-
-class FormatNotFoundError(OpenModelDBError):
-    """Raised when a requested format is not available for a model."""
-
-class DownloadError(OpenModelDBError):
-    """Raised when a download fails."""
 
 
 @dataclass
@@ -60,12 +58,35 @@ class OpenModelDB:
         db.download(models[0])
     """
 
-    def __init__(self, cache_dir: str | None = None, download_dir: str | None = None):
+    def __init__(
+        self,
+        cache_dir: str | None = None,
+        download_dir: str | None = None,
+        include_all: bool = False,
+    ):
         self._cache_dir = cache_dir or DEFAULT_CACHE_DIR
         self._cache_file = os.path.join(self._cache_dir, "models.json")
+        self._meta_file = self._cache_file + ".meta"
         self._download_dir = download_dir or DEFAULT_DOWNLOAD_DIR
+        self._include_all = include_all
         self._raw_data: dict | None = None
         self._models: list[Model] | None = None
+
+    # ─── Public accessors ──────────────────────────────────────────────────
+
+    @property
+    def download_dir(self) -> str:
+        """Directory where downloaded model files are saved."""
+        return self._download_dir
+
+    @property
+    def cache_dir(self) -> str:
+        """Directory used to cache the API response and intermediate downloads."""
+        return self._cache_dir
+
+    def cache_is_valid(self) -> bool:
+        """Whether the local models.json cache exists and is still fresh."""
+        return self._cache_is_valid()
 
     # ─── Data loading ────────────────────────────────────────────────────
 
@@ -78,39 +99,172 @@ class OpenModelDB:
         with open(self._cache_file, "r", encoding="utf-8") as f:
             return json.load(f)
 
-    def _save_cache(self, data: dict):
+    def _load_meta(self) -> dict | None:
+        """Load the cache sidecar metadata (etag/last-modified), if any and valid."""
+        if not os.path.exists(self._meta_file):
+            return None
+        try:
+            with open(self._meta_file, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return None
+
+    def _save_meta(self, headers) -> None:
+        """Save (or clear) the cache sidecar metadata from response headers."""
+        meta = {}
+        if headers is not None:
+            etag = headers.get("ETag")
+            last_modified = headers.get("Last-Modified")
+            if etag:
+                meta["etag"] = etag
+            if last_modified:
+                meta["last_modified"] = last_modified
+
+        if meta:
+            with open(self._meta_file, "w", encoding="utf-8") as f:
+                json.dump(meta, f)
+        elif os.path.exists(self._meta_file):
+            try:
+                os.remove(self._meta_file)
+            except OSError:
+                pass
+
+    def _save_cache(self, data: dict, headers=None):
         os.makedirs(self._cache_dir, exist_ok=True)
         with open(self._cache_file, "w", encoding="utf-8") as f:
             json.dump(data, f)
+        self._save_meta(headers)
+
+    def _discard_cache(self) -> None:
+        """Remove a corrupt/stale cache file and its meta sidecar."""
+        for path in (self._cache_file, self._meta_file):
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+
+    def _fetch_remote(self) -> dict:
+        """Fetch fresh data from the API and update the cache.
+
+        If a cache meta sidecar exists, sends conditional request headers
+        (If-None-Match / If-Modified-Since). A 304 response means the
+        existing cache is still current: it is reused and its mtime is
+        refreshed instead of re-downloading the body.
+
+        Any network failure (URLError, non-304 HTTPError, timeout, or a
+        connection error mid-read such as ConnectionResetError or
+        IncompleteRead) or response JSON decode error is wrapped as
+        OpenModelDBError.
+        """
+        headers = {"User-Agent": USER_AGENT}
+        # Only attempt a conditional request if we actually have a cache
+        # file to fall back on for a 304 response.
+        meta = self._load_meta() if os.path.exists(self._cache_file) else None
+        if meta:
+            etag = meta.get("etag")
+            last_modified = meta.get("last_modified")
+            if etag:
+                headers["If-None-Match"] = etag
+            if last_modified:
+                headers["If-Modified-Since"] = last_modified
+
+        req = urllib.request.Request(API_URL, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                body = resp.read().decode()
+                resp_headers = resp.headers
+        except urllib.error.HTTPError as e:
+            if e.code == 304:
+                # Server confirms our cache is still current.
+                now = time.time()
+                os.utime(self._cache_file, (now, now))
+                try:
+                    return self._load_cache()
+                except json.JSONDecodeError as je:
+                    raise OpenModelDBError(
+                        f"Cache file corrupt after 304 response from {API_URL}"
+                    ) from je
+            raise OpenModelDBError(f"Failed to fetch {API_URL}: {e}") from e
+        except urllib.error.URLError as e:
+            raise OpenModelDBError(f"Failed to fetch {API_URL}: {e.reason}") from e
+        except TimeoutError as e:
+            raise OpenModelDBError(f"Timed out while fetching {API_URL}: {e}") from e
+        except (OSError, http.client.HTTPException) as e:
+            # Covers connection drops mid-read (ConnectionResetError) and
+            # truncated bodies (http.client.IncompleteRead), neither of
+            # which is a URLError/HTTPError.
+            raise OpenModelDBError(f"Connection error while fetching {API_URL}: {e}") from e
+
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError as e:
+            raise OpenModelDBError(f"Invalid JSON received from {API_URL}: {e}") from e
+
+        self._save_cache(data, resp_headers)
+        return data
 
     def _fetch(self) -> dict:
-        """Fetch all models from the API or cache."""
+        """Fetch all models from the API or cache.
+
+        Uses a valid local cache when present. Otherwise fetches from the
+        API; if that fetch fails and a (possibly expired) cache file
+        exists, falls back to it with a warning printed to stderr rather
+        than raising. Only raises OpenModelDBError when there is no cache
+        to fall back to.
+        """
         if self._raw_data is not None:
             return self._raw_data
 
         if self._cache_is_valid():
-            self._raw_data = self._load_cache()
-        else:
-            req = urllib.request.Request(API_URL, headers={"User-Agent": "OpenModelDB-Py/1.0"})
-            resp = urllib.request.urlopen(req, timeout=60)
-            self._raw_data = json.loads(resp.read().decode())
-            self._save_cache(self._raw_data)
+            try:
+                self._raw_data = self._load_cache()
+                return self._raw_data
+            except json.JSONDecodeError:
+                # Corrupt cache: treat as no cache and fall through to refetch.
+                self._discard_cache()
+
+        try:
+            self._raw_data = self._fetch_remote()
+        except OpenModelDBError as e:
+            if os.path.exists(self._cache_file):
+                try:
+                    data = self._load_cache()
+                except json.JSONDecodeError:
+                    # Cache is also corrupt; nothing usable to fall back to.
+                    self._discard_cache()
+                    raise
+                mtime = os.path.getmtime(self._cache_file)
+                date_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(mtime))
+                # Prefer the wrapped exception's own message (e.g. the
+                # underlying URLError/JSONDecodeError) as the brief reason,
+                # since it's more specific than the generic wrapper text.
+                reason = str(e.__cause__) if e.__cause__ is not None else str(e)
+                print(
+                    f"warning: failed to fetch openmodeldb API ({reason}), "
+                    f"using stale cache from {date_str}",
+                    file=sys.stderr,
+                )
+                self._raw_data = data
+            else:
+                raise
 
         return self._raw_data
 
     def refresh(self):
-        """Force re-fetch from the API, ignoring cache."""
+        """Force re-fetch from the API, ignoring cache freshness.
+
+        Unlike the implicit fetch used by ``models``/etc., this does not
+        fall back to a stale cache on failure — an explicit refresh must
+        fail loudly, propagating as OpenModelDBError.
+        """
         self._raw_data = None
         self._models = None
-        req = urllib.request.Request(API_URL, headers={"User-Agent": "OpenModelDB-Py/1.0"})
-        resp = urllib.request.urlopen(req, timeout=60)
-        self._raw_data = json.loads(resp.read().decode())
-        self._save_cache(self._raw_data)
+        self._raw_data = self._fetch_remote()
 
     def clear_cache(self):
-        """Delete the local cache file."""
-        if os.path.exists(self._cache_file):
-            os.remove(self._cache_file)
+        """Delete the local cache file (and its metadata sidecar)."""
+        self._discard_cache()
         self._raw_data = None
         self._models = None
 
@@ -123,7 +277,7 @@ class OpenModelDB:
         models = []
         for model_id, data in raw.items():
             arch = (data.get("architecture") or "other").lower()
-            if arch in EXCLUDED_ARCHS:
+            if not self._include_all and arch in EXCLUDED_ARCHS:
                 continue
             author = data.get("author", "unknown")
             if isinstance(author, list):
@@ -300,16 +454,29 @@ class OpenModelDB:
         return sorted(all_tags)
 
     def _resolve_model(self, name: str) -> Model:
-        """Resolve a string name/id to a Model object."""
+        """Resolve a string name/id to a Model object.
+
+        Tries an exact (case-insensitive) id/name match first. If none is
+        found, falls back to a partial (substring) match: exactly one
+        partial match is returned, but several partial matches are treated
+        as an ambiguous query and raise rather than silently picking the
+        first one.
+        """
         q = name.lower()
         # Exact match first
         for m in self.models:
             if m.id.lower() == q or m.name.lower() == q:
                 return m
-        # Partial match
-        for m in self.models:
-            if q in m.name.lower() or q in m.id.lower():
-                return m
+        # Partial match: collect every candidate before deciding.
+        partial = [m for m in self.models if q in m.name.lower() or q in m.id.lower()]
+        if len(partial) == 1:
+            return partial[0]
+        if len(partial) > 1:
+            ids = [m.id for m in partial[:5]]
+            suffix = f", ... ({len(partial)} matches)" if len(partial) > 5 else ""
+            raise ModelNotFoundError(
+                f"Ambiguous model name '{name}': matches {', '.join(ids)}{suffix}"
+            )
         raise ModelNotFoundError(f"Model not found: '{name}'")
 
     def get_url(self, model: Model | str, format: str | None = None) -> str:
@@ -389,6 +556,7 @@ class OpenModelDB:
         Raises:
             DownloadError: When target_ext is not set and no file can be found.
         """
+        import shutil
         import zipfile
 
         expected_size = res.get("size")
@@ -399,7 +567,7 @@ class OpenModelDB:
             out_path = os.path.join(dest_dir, out_name)
             os.makedirs(dest_dir, exist_ok=True)
             with zf.open(info) as src, open(out_path, "wb") as dst:
-                dst.write(src.read())
+                shutil.copyfileobj(src, dst)
             return out_path
 
         with zipfile.ZipFile(zip_path) as zf:
@@ -452,6 +620,7 @@ class OpenModelDB:
         Returns:
             List of paths to extracted files.
         """
+        import shutil
         import zipfile
 
         MODEL_EXTS = {".pth", ".safetensors", ".onnx", ".pt", ".bin", ".ckpt"}
@@ -474,10 +643,43 @@ class OpenModelDB:
 
                 out_path = os.path.join(dest_dir, name)
                 with zf.open(info) as src, open(out_path, "wb") as dst:
-                    dst.write(src.read())
+                    shutil.copyfileobj(src, dst)
                 paths.append(out_path)
 
         return paths
+
+    def _print_downloading(
+        self, model: Model, file_ext: str, extra: str = "", quiet: bool = False,
+    ) -> None:
+        """Print the bold 'Downloading ...' status line for a model."""
+        if not quiet:
+            print(
+                f"  Downloading \033[1m{model.name}\033[0m by {model.author} "
+                f"({model.architecture}, {model.scale}x) [{file_ext}{extra}]"
+            )
+
+    def _download_to_cache(self, url: str, file_name: str, quiet: bool = False) -> str:
+        """Download *url* into ``self._cache_dir`` unless already cached.
+
+        Returns the path to the cached file. Prints the 'Using cached ...'
+        line when a previously-downloaded copy is reused.
+        """
+        from openmodeldb.downloader import smart_download
+
+        cache_path = os.path.join(self._cache_dir, file_name)
+        if not os.path.exists(cache_path):
+            smart_download(url, cache_path, quiet=quiet)
+        elif not quiet:
+            print(f"  Using cached \033[2m{cache_path}\033[0m")
+        return cache_path
+
+    def _cleanup(self, *paths: str) -> None:
+        """Best-effort removal of one or more paths (duplicates skipped)."""
+        for p in set(paths):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
 
     def download(
         self,
@@ -502,7 +704,7 @@ class OpenModelDB:
         Returns:
             Path to the downloaded file.
         """
-        from openmodeldb.downloader import smart_download, pick_best_url, build_filename
+        from openmodeldb.downloader import build_filename, pick_best_url, smart_download
 
         # Resolve string to Model
         if isinstance(model, str):
@@ -540,24 +742,14 @@ class OpenModelDB:
         is_zip = self._is_zip_url(dl_url)
 
         if need_onnx_convert:
-            if not quiet:
-                print(f"  Downloading \033[1m{model.name}\033[0m by {model.author} ({model.architecture}, {model.scale}x) [{file_ext}]")
-
-            # Download to cache
-            cache_path = os.path.join(self._cache_dir, file_name)
-            if not os.path.exists(cache_path):
-                smart_download(dl_url, cache_path, quiet=quiet)
-            elif not quiet:
-                print(f"  Using cached \033[2m{cache_path}\033[0m")
+            self._print_downloading(model, file_ext, quiet=quiet)
+            cache_path = self._download_to_cache(dl_url, file_name, quiet=quiet)
 
             # If zip, try to find a pre-built ONNX inside first
             if is_zip:
                 onnx_from_zip = self._extract_from_zip(cache_path, res, dest_dir, target_ext=".onnx")
                 if onnx_from_zip:
-                    try:
-                        os.remove(cache_path)
-                    except OSError:
-                        pass
+                    self._cleanup(cache_path)
                     if not quiet:
                         size_mb = os.path.getsize(onnx_from_zip) / 1048576
                         print(f"  \033[92m✓\033[0m Extracted \033[2m{onnx_from_zip}\033[0m ({size_mb:.1f} MB)\n")
@@ -575,13 +767,12 @@ class OpenModelDB:
             onnx_path = os.path.join(dest_dir, f"{onnx_name}.onnx")
 
             if os.path.exists(onnx_path):
-                for p in {cache_path, model_path}:
-                    try:
-                        os.remove(p)
-                    except OSError:
-                        pass
+                self._cleanup(cache_path, model_path)
                 if not quiet:
-                    print(f"  \033[92m✓\033[0m \033[1m{model.name}\033[0m ONNX already exists \033[2m({onnx_path})\033[0m")
+                    print(
+                        f"  \033[92m✓\033[0m \033[1m{model.name}\033[0m "
+                        f"ONNX already exists \033[2m({onnx_path})\033[0m"
+                    )
                 return onnx_path
 
             # Convert to ONNX
@@ -594,12 +785,7 @@ class OpenModelDB:
                 quiet=quiet,
             )
 
-            # Clean up cached files
-            for p in {cache_path, model_path}:
-                try:
-                    os.remove(p)
-                except OSError:
-                    pass
+            self._cleanup(cache_path, model_path)
 
             if not quiet:
                 print()
@@ -607,15 +793,8 @@ class OpenModelDB:
 
         if need_format_convert:
             fmt_lower = format.lower().lstrip(".")
-            if not quiet:
-                print(f"  Downloading \033[1m{model.name}\033[0m by {model.author} ({model.architecture}, {model.scale}x) [{file_ext} → {fmt_lower}]")
-
-            # Download source to cache
-            cache_path = os.path.join(self._cache_dir, file_name)
-            if not os.path.exists(cache_path):
-                smart_download(dl_url, cache_path, quiet=quiet)
-            elif not quiet:
-                print(f"  Using cached \033[2m{cache_path}\033[0m")
+            self._print_downloading(model, file_ext, extra=f" → {fmt_lower}", quiet=quiet)
+            cache_path = self._download_to_cache(dl_url, file_name, quiet=quiet)
 
             if is_zip:
                 model_path = self._extract_from_zip(cache_path, res, self._cache_dir)
@@ -627,11 +806,7 @@ class OpenModelDB:
             out_path = os.path.join(dest_dir, out_name)
 
             if os.path.exists(out_path):
-                for p in {cache_path, model_path}:
-                    try:
-                        os.remove(p)
-                    except OSError:
-                        pass
+                self._cleanup(cache_path, model_path)
                 if not quiet:
                     print(f"  \033[92m✓\033[0m \033[1m{model.name}\033[0m already exists \033[2m({out_path})\033[0m")
                 return out_path
@@ -646,12 +821,7 @@ class OpenModelDB:
                 quiet=quiet,
             )
 
-            # Clean up cached files
-            for p in {cache_path, model_path}:
-                try:
-                    os.remove(p)
-                except OSError:
-                    pass
+            self._cleanup(cache_path, model_path)
 
             if not quiet:
                 print()
@@ -660,23 +830,15 @@ class OpenModelDB:
         # Normal (non-convert) download
         if is_zip:
             # Download zip to cache, extract the model to dest
-            cache_path = os.path.join(self._cache_dir, file_name)
+            self._print_downloading(model, file_ext, quiet=quiet)
+            cache_path = self._download_to_cache(dl_url, file_name, quiet=quiet)
 
             if not quiet:
-                print(f"  Downloading \033[1m{model.name}\033[0m by {model.author} ({model.architecture}, {model.scale}x) [{file_ext}]")
-
-            if not os.path.exists(cache_path):
-                smart_download(dl_url, cache_path, quiet=quiet)
-
-            if not quiet:
-                print(f"  Extracting from archive...")
+                print("  Extracting from archive...")
             file_path = self._extract_from_zip(cache_path, res, dest_dir)
 
             # Clean up the zip
-            try:
-                os.remove(cache_path)
-            except OSError:
-                pass
+            self._cleanup(cache_path)
 
             if os.path.exists(file_path):
                 if not quiet:
@@ -690,8 +852,7 @@ class OpenModelDB:
                 print(f"  \033[92m✓\033[0m \033[1m{model.name}\033[0m already exists \033[2m({file_path})\033[0m")
             return file_path
 
-        if not quiet:
-            print(f"  Downloading \033[1m{model.name}\033[0m by {model.author} ({model.architecture}, {model.scale}x) [{file_ext}]")
+        self._print_downloading(model, file_ext, quiet=quiet)
         smart_download(dl_url, file_path, quiet=quiet)
         if not quiet:
             print(f"  \033[92m✓\033[0m Saved to \033[2m{file_path}\033[0m\n")
@@ -719,7 +880,7 @@ class OpenModelDB:
         Returns:
             List of paths to downloaded/extracted files.
         """
-        from openmodeldb.downloader import smart_download, pick_best_url, build_filename
+        from openmodeldb.downloader import build_filename, pick_best_url, smart_download
 
         if isinstance(model, str):
             model = self._resolve_model(model)
@@ -754,7 +915,7 @@ class OpenModelDB:
                     smart_download(dl_url, cache_path, quiet=quiet)
 
                 if not quiet:
-                    print(f"  Extracting from archive...")
+                    print("  Extracting from archive...")
 
                 extracted = self._extract_all_from_zip(cache_path, dest_dir, ext_filter)
                 all_paths.extend(extracted)
@@ -805,7 +966,7 @@ class OpenModelDB:
             raise FileNotFoundError(file_path)
 
         from openmodeldb.converter import compare_weights
-        from openmodeldb.downloader import smart_download, pick_best_url, build_filename
+        from openmodeldb.downloader import build_filename, pick_best_url, smart_download
 
         basename = os.path.basename(file_path)
         stem = os.path.splitext(basename)[0]
@@ -889,5 +1050,5 @@ class OpenModelDB:
 
     def interactive(self):
         """Launch the interactive CLI for browsing and downloading models."""
-        from openmodeldb.cli import main
-        main(self)
+        from openmodeldb.cli import interactive as _interactive
+        _interactive(self)

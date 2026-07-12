@@ -1,7 +1,9 @@
 """
-Interactive CLI for browsing and downloading OpenModelDB models.
+CLI for browsing and downloading OpenModelDB models — interactive picker
+plus scriptable argparse subcommands.
 """
 
+import argparse
 import os
 import sys
 import threading
@@ -10,10 +12,17 @@ import time
 from InquirerPy import inquirer
 from InquirerPy.separator import Separator
 
+from openmodeldb.client import OpenModelDB
 from openmodeldb.downloader import (
-    fmt_size, is_mega_url, is_mediafire_url, is_gdrive_url,
-    smart_download, pick_best_url, build_filename,
+    build_filename,
+    fmt_size,
+    is_gdrive_url,
+    is_mediafire_url,
+    is_mega_url,
+    pick_best_url,
+    smart_download,
 )
+from openmodeldb.exceptions import OpenModelDBError
 
 
 # ─── COLORS ──────────────────────────────────────────────────────────────────
@@ -72,10 +81,9 @@ def header():
 """)
 
 
-def main(db=None):
+def interactive(db=None):
     """Run the interactive CLI."""
     if db is None:
-        from openmodeldb.client import OpenModelDB
         db = OpenModelDB()
 
     print("\033[2J\033[H", end="", flush=True)
@@ -92,7 +100,7 @@ def main(db=None):
     ).execute()
 
     # 2) Fetch models
-    cached = db._cache_is_valid()
+    cached = db.cache_is_valid()
     spinner = Spinner(
         "Loading from cache…" if cached else "Fetching model database…"
     ).start()
@@ -175,7 +183,7 @@ def main(db=None):
     dl_url = pick_best_url(urls)
     file_ext = res.get("type", "pth")
     file_name = build_filename(dl_url, model.id, file_ext)
-    dest = os.path.join(db._download_dir, file_name)
+    dest = os.path.join(db.download_dir, file_name)
 
     # Host tag
     if is_mega_url(dl_url):
@@ -209,3 +217,103 @@ def main(db=None):
     except Exception as e:
         print(f"\n  {C.RED}Download failed: {e}{C.RESET}\n")
         sys.exit(1)
+
+
+# ─── SCRIPTABLE CLI ──────────────────────────────────────────────────────────
+
+def _get_version() -> str:
+    """Resolve the installed package version, falling back to __version__."""
+    try:
+        from importlib.metadata import PackageNotFoundError, version
+        try:
+            return version("openmodeldb")
+        except PackageNotFoundError:
+            pass
+    except ImportError:
+        pass
+    from openmodeldb import __version__
+    return __version__
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="openmodeldb",
+        description="Browse and download AI upscaling models from OpenModelDB.",
+    )
+    parser.add_argument(
+        "--version", action="store_true", help="show the installed version and exit",
+    )
+
+    sub = parser.add_subparsers(dest="command")
+
+    p_list = sub.add_parser("list", help="List models (formatted table)")
+    p_list.add_argument("--scale", type=int, help="filter by scale factor")
+    p_list.add_argument("--arch", help="filter by architecture")
+    p_list.add_argument("--tag", help="filter by tag")
+
+    p_search = sub.add_parser("search", help="Search models by name, author, tags or description")
+    p_search.add_argument("query", help="search query")
+
+    p_download = sub.add_parser("download", help="Download a model")
+    p_download.add_argument("name", help="model name or id")
+    p_download.add_argument("--format", help="file format (pth, safetensors, onnx)")
+    p_download.add_argument("--dest", help="destination directory")
+    p_download.add_argument(
+        "--half", action="store_true",
+        help="export ONNX in FP16 instead of FP32 (only meaningful with --format onnx)",
+    )
+    p_download.add_argument(
+        "--all", action="store_true", help="download/extract all files for the model",
+    )
+
+    p_check = sub.add_parser("check", help="Check a local model file's integrity against the reference")
+    p_check.add_argument("file", help="path to the local model file")
+
+    return parser
+
+
+def main(argv=None):
+    """Scriptable entry point: dispatches to a subcommand, or the interactive
+    picker when called with no arguments."""
+    if argv is None:
+        argv = sys.argv[1:]
+
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+
+    if args.version:
+        print(_get_version())
+        return
+
+    try:
+        if args.command is None:
+            interactive()
+            return
+
+        db = OpenModelDB()
+
+        if args.command == "list":
+            db.list(scale=args.scale, architecture=args.arch, tag=args.tag)
+        elif args.command == "search":
+            results = db.search(args.query)
+            for m in results:
+                print(
+                    f"{C.DIM}{m.id}{C.RESET}  ·  "
+                    f"{m.name} — {m.author} ({m.architecture}, {m.scale}x)"
+                )
+        elif args.command == "download":
+            if args.all:
+                if args.half:
+                    print("note: --half is ignored with --all", file=sys.stderr)
+                db.download_all(args.name, dest=args.dest, format=args.format)
+            else:
+                db.download(args.name, dest=args.dest, format=args.format, half=args.half)
+        elif args.command == "check":
+            result = db.test_integrity(args.file)
+            if not (result["identical"] or result["similarity"] > 99.9):
+                sys.exit(1)
+    except (OpenModelDBError, FileNotFoundError, ImportError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        sys.exit(130)

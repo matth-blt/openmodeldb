@@ -1,4 +1,31 @@
+# Byte-compiled / caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Packaging
+build/
 dist/
 *.egg-info/
-__pycache__/
+
+# Virtual environments
+.venv/
+venv/
+
+# Project artifacts
 downloads/
+*.part
+*.onnx
+*.pth
+*.safetensors
+
+# Coverage
+.coverage
+htmlcov/
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/
