@@ -22,7 +22,7 @@ from rich.progress import (
 
 from openmodeldb.exceptions import DownloadError
 
-USER_AGENT = "OpenModelDB-Py/1.1.1"
+USER_AGENT = "OpenModelDB-Py/1.2.0"
 
 
 def _open_url(url: str, req: "urllib.request.Request | None" = None, timeout: float | None = None):

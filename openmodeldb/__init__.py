@@ -26,4 +26,4 @@ __all__ = [
     "FormatNotFoundError",
     "DownloadError",
 ]
-__version__ = "1.1.1"
+__version__ = "1.2.0"
