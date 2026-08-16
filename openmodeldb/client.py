@@ -561,13 +561,13 @@ class OpenModelDB:
         """Extract a model file from a zip archive.
 
         Args:
-            zip_path: 
+            zip_path:
                 Path to the zip file.
-            res: 
+            res:
                 Resource dict (with 'size' and 'type').
-            dest_dir: 
+            dest_dir:
                 Directory to write the extracted file.
-            target_ext: 
+            target_ext:
                 If set (e.g. ".onnx"), look for a sibling file with this
                 extension instead of the resource's own type.
                 Returns None if no such file is found. Sibling files
@@ -646,7 +646,7 @@ class OpenModelDB:
                         if fstem == stem and fext.lower() == target_ext:
                             return _write(zf, info)
                 return None
-            
+
             if expected_size:
                 for info in entries:
                     if info.file_size == expected_size:
@@ -802,17 +802,17 @@ class OpenModelDB:
         Download a model file.
 
         Args:
-            model: 
+            model:
                 The Model to download, or a model name/id string.
-            dest: 
+            dest:
                 Destination directory (default: ./downloads/).
-            format: 
+            format:
                 File format to download ('pth', 'safetensors', 'onnx').
                 If 'onnx' is requested but not available, downloads
                 a PyTorch format and converts automatically.
-            quiet: 
+            quiet:
                 If True, download silently (no prints or progress bar).
-            half: 
+            half:
                 If True and converting to ONNX, export in FP16 instead of FP32.
 
         Returns:
@@ -985,13 +985,13 @@ class OpenModelDB:
         Use ``format`` to filter by extension (e.g. ``"onnx"``).
 
         Args:
-            model: 
+            model:
                 The Model or a model name/id string.
-            dest: 
+            dest:
                 Destination directory (default: ./downloads/).
-            format: 
+            format:
                 Only extract files with this extension (e.g. "onnx", "pth").
-            quiet: 
+            quiet:
                 If True, suppress output.
 
         Returns:

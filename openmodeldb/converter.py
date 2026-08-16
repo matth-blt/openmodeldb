@@ -38,12 +38,11 @@ def _check_dependencies():
     """Check that ONNX conversion dependencies are installed."""
     missing = []
     try:
-        import torch
         _check_torch_safety()
     except ImportError:
         missing.append("torch")
     try:
-        import onnx
+        import onnx  # noqa: F401
     except ImportError:
         missing.append("onnx")
     try:
@@ -316,18 +315,18 @@ def convert_to_onnx(
     Convert a PyTorch model (.pth / .safetensors) to ONNX.
 
     Args:
-        model_path: 
+        model_path:
             Path to the source PyTorch model file.
-        output_path: 
+        output_path:
             Path for the output ONNX file.
             If None, replaces the extension with .onnx in the same directory.
-        opset: 
+        opset:
             ONNX opset version (default: 20).
-        half: 
+        half:
             If True, convert to FP16. Otherwise FP32.
-        optimize: 
+        optimize:
             If True, apply ORT graph optimizations.
-        quiet: 
+        quiet:
             If True, suppress all output.
 
     Returns:
