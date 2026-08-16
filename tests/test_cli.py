@@ -174,7 +174,6 @@ def test_no_args_routes_to_interactive(monkeypatch):
 def test_check_identical_exits_0(stub_db):
     StubDB.integrity_result = dict(DEFAULT_INTEGRITY_RESULT, similarity=100.0, identical=True)
 
-    # Should complete without raising SystemExit.
     cli.main(["check", "somefile.pth"])
 
     db = StubDB.instances[-1]

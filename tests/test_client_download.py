@@ -41,7 +41,6 @@ def test_resolve_ambiguous_partial_match_raises(db):
 
     message = str(exc_info.value)
     assert message.startswith("Ambiguous model name '4x-': matches")
-    # All four 4x- models should be listed as candidates.
     for candidate in (
         "4x-ExamplePth",
         "4x-DualFormat",
@@ -60,8 +59,6 @@ def test_resolve_unknown_raises(db):
 def test_resolve_ambiguous_partial_match_truncates_with_total_count(db):
     from openmodeldb import Model
 
-    # Seed more than 5 candidates sharing a common substring so the
-    # message truncates to the first 5 and appends a total-match count.
     fake_models = [
         Model(
             id=f"4x-Fake{i}", name=f"Fake{i}", author="tester",
@@ -78,7 +75,6 @@ def test_resolve_ambiguous_partial_match_truncates_with_total_count(db):
     assert message.startswith("Ambiguous model name '4x-Fake': matches")
     assert "(7 matches)" in message
     assert message.endswith(", ... (7 matches)")
-    # Only the first 5 candidates should be listed by name.
     for i in range(5):
         assert f"4x-Fake{i}" in message
     for i in range(5, 7):
@@ -150,8 +146,6 @@ def test_download_direct_second_call_uses_existing_file(db, fake_smart_download)
 
     assert first == second
     assert os.path.exists(second)
-    # smart_download must have been invoked only once — the second call
-    # short-circuits on the already-existing output file.
     assert len(fake_smart_download) == 1
 
 
@@ -200,11 +194,59 @@ def test_download_zip_extracts_member_and_removes_cached_zip(
     with open(path, "rb") as f:
         assert f.read() == b"fake-pth-weights"
 
-    # The cached zip must be cleaned up after extraction.
     cache_zip_path = os.path.join(db.cache_dir, "ziparchive.zip")
     assert not os.path.exists(cache_zip_path)
 
     assert len(fake_smart_download_zip) == 1
+
+
+# ─── download(): untrusted model.id must not reach the filesystem ─────
+
+def test_download_format_convert_sanitizes_traversal_model_id(db, monkeypatch):
+    """A malicious model id (e.g. from a poisoned DB entry) must never
+    escape the download dir when it becomes an output filename."""
+    import hashlib
+
+    from openmodeldb import Model
+
+    dummy = b"dummy-model-bytes"
+    evil = Model(
+        id="evil/../../4x-DualFormat",
+        name="Evil Net",
+        author="mallory",
+        architecture="span",
+        scale=4,
+        resources=[{
+            "platform": "pytorch",
+            "type": "pth",
+            "size": len(dummy),
+            "sha256": hashlib.sha256(dummy).hexdigest(),
+            "urls": ["https://huggingface.co/mallory/evil/resolve/main/dual.pth"],
+        }],
+    )
+    db._models = [evil]
+
+    def _fake(url, dest, quiet=False):
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        with open(dest, "wb") as f:
+            f.write(dummy)
+
+    monkeypatch.setattr("openmodeldb.downloader.smart_download", _fake)
+
+    def _fake_convert(model_path: str, output_path: str | None = None, target: str = "safetensors", quiet: bool = False):
+        assert output_path is not None
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        with open(output_path, "wb") as f:
+            f.write(b"converted")
+        return output_path
+
+    monkeypatch.setattr("openmodeldb.converter.convert_format", _fake_convert)
+
+    path = db.download(evil, format="safetensors", quiet=True)
+
+    assert ".." not in path
+    assert os.path.dirname(path) == db.download_dir
+    assert os.path.exists(path)
 
 
 # ─── download_dir / cache_dir / cache_is_valid() ─────────────────────────

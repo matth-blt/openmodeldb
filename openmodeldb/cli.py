@@ -27,15 +27,15 @@ from openmodeldb.exceptions import OpenModelDBError
 
 # ─── COLORS ──────────────────────────────────────────────────────────────────
 class C:
-    RESET   = "\033[0m"
-    BOLD    = "\033[1m"
-    DIM     = "\033[2m"
-    CYAN    = "\033[96m"
-    GREEN   = "\033[92m"
-    YELLOW  = "\033[93m"
-    RED     = "\033[91m"
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+    CYAN = "\033[96m"
+    GREEN = "\033[92m"
+    YELLOW = "\033[93m"
+    RED = "\033[91m"
     MAGENTA = "\033[95m"
-    WHITE   = "\033[97m"
+    WHITE = "\033[97m"
 
 
 class Spinner:
@@ -44,7 +44,7 @@ class Spinner:
     def __init__(self, text="Loading…"):
         self.text = text
         self._stop = threading.Event()
-        self._thread = None
+        self._thread: threading.Thread | None = None
 
     def _spin(self):
         i = 0
@@ -64,12 +64,14 @@ class Spinner:
 
     def succeed(self, text):
         self._stop.set()
-        self._thread.join()
+        if self._thread is not None:
+            self._thread.join()
         print(f"\r  {C.GREEN}✓{C.RESET} {text}                    ")
 
     def fail(self, text):
         self._stop.set()
-        self._thread.join()
+        if self._thread is not None:
+            self._thread.join()
         print(f"\r  {C.RED}✗{C.RESET} {text}                    ")
 
 
@@ -212,6 +214,9 @@ def interactive(db=None):
     print()
     try:
         smart_download(dl_url, dest)
+        if res.get("sha256"):
+            from openmodeldb.downloader import verify_sha256
+            verify_sha256(dest, res["sha256"])
         print(f"\n  {C.GREEN}{C.BOLD}✓ Downloaded successfully!{C.RESET}")
         print(f"    {C.DIM}{dest}{C.RESET}\n")
     except Exception as e:

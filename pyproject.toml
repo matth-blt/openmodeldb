@@ -26,12 +26,11 @@ dependencies = [
     "InquirerPy>=0.3.4",
     "pycryptodome>=3.18.0",
     "rich>=13.0.0",
-    "mediafiredl>=0.0.2"
 ]
 
 [project.optional-dependencies]
 convert = [
-    "torch>=2.0",
+    "torch>=2.6",
     "safetensors>=0.3",
     "onnx>=1.14",
     "onnxruntime>=1.15",

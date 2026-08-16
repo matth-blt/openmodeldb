@@ -2,11 +2,12 @@
 Download handlers for various file hosting services.
 """
 
+import hashlib
 import os
 import re
 import urllib.error
 import urllib.request
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 
 from rich.progress import (
     BarColumn,
@@ -25,14 +26,35 @@ from openmodeldb.exceptions import DownloadError
 USER_AGENT = "OpenModelDB-Py/1.2.0"
 
 
+def _url_hostname(url: str) -> str:
+    """Lowercased hostname of *url* ("" if unparseable)."""
+    try:
+        return (urlparse(url).hostname or "").lower()
+    except ValueError:
+        return ""
+
+
+def _host_is(host: str, domain: str) -> bool:
+    """True when *host* is exactly *domain* or a subdomain of it."""
+    return host == domain or host.endswith("." + domain)
+
+
 def _open_url(url: str, req: "urllib.request.Request | None" = None, timeout: float | None = None):
     """Open a URL via urllib, wrapping network errors as DownloadError.
+
+    Only http/https URLs are accepted — urllib would happily fetch
+    ``file://`` or ``ftp://`` URLs coming from untrusted API data otherwise.
 
     Returns the response object (a context manager) on success. Any
     HTTPError, URLError, or timeout is caught and re-raised as a
     DownloadError carrying the URL and underlying reason.
     """
     request = req if req is not None else urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    scheme = urlparse(request.full_url).scheme.lower()
+    if scheme not in ("http", "https"):
+        raise DownloadError(
+            f"Unsupported URL scheme {scheme!r} (only http/https allowed): {url}"
+        )
     try:
         return urllib.request.urlopen(request, timeout=timeout)
     except urllib.error.HTTPError as e:
@@ -114,16 +136,51 @@ def _download_with_progress(resp, dest: str, total: int | None = None, transform
     os.replace(part_path, dest)
 
 
+def sha256_of_file(path: str) -> str:
+    """Compute the SHA-256 hex digest of a file (chunked read)."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def verify_sha256(path: str, expected: str, remove_on_mismatch: bool = True) -> None:
+    """Verify a downloaded file's SHA-256 against the expected digest.
+
+    Raises DownloadError on mismatch (deleting the file first, best-effort,
+    unless *remove_on_mismatch* is False). Comparison is case-insensitive.
+    """
+    actual = sha256_of_file(path)
+    if actual != expected.lower():
+        if remove_on_mismatch:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        raise DownloadError(
+            f"SHA-256 mismatch for {os.path.basename(path)}: expected "
+            f"{expected.lower()}, got {actual}. The download may be corrupted "
+            f"or tampered with; the file has been removed."
+        )
+
+
 def is_mega_url(url: str) -> bool:
-    return "mega.nz" in url or "mega.co.nz" in url
+    h = _url_hostname(url)
+    return _host_is(h, "mega.nz") or _host_is(h, "mega.co.nz")
 
 
 def is_mediafire_url(url: str) -> bool:
-    return "mediafire.com" in url
+    return _host_is(_url_hostname(url), "mediafire.com")
 
 
 def is_gdrive_url(url: str) -> bool:
-    return "drive.google.com" in url
+    h = _url_hostname(url)
+    return (
+        _host_is(h, "drive.google.com")
+        or _host_is(h, "docs.google.com")
+        or _host_is(h, "drive.usercontent.google.com")
+    )
 
 
 def _convert_gdrive_url(url: str) -> str:
@@ -143,6 +200,7 @@ _HTML_TAG_ATTR_RE = re.compile(
     re.S,
 )
 _INPUT_TAG_RE = re.compile(r"<input\b[^>]*>", re.I)
+_ANCHOR_TAG_RE = re.compile(r"<a\b[^>]*>", re.I)
 
 
 def _parse_html_attrs(tag: str) -> dict:
@@ -192,6 +250,8 @@ def _parse_gdrive_confirm_form(html: str):
     return action, params
 
 
+# DOCS
+# https://github.com/meganz/sdk — Mega file/key handling and AES-CTR layout
 def download_mega(url: str, dest: str, quiet: bool = False):
     """Download from Mega.nz using native crypto (no external Mega lib)."""
     import base64
@@ -213,7 +273,6 @@ def download_mega(url: str, dest: str, quiet: bool = False):
     def _mega_parse_url(url):
         """Extract file ID and key from a Mega.nz URL."""
         import re
-        # Handle mega.nz/file/ID#KEY and mega.nz/#!ID!KEY formats
         m = re.search(r"mega\.nz/file/([^#]+)#(.+)", url)
         if m:
             return m.group(1), m.group(2)
@@ -225,7 +284,6 @@ def download_mega(url: str, dest: str, quiet: bool = False):
     file_id, key_str = _mega_parse_url(url)
     key = _mega_key(key_str)
 
-    # Get file info from Mega API
     api_url = "https://g.api.mega.co.nz/cs"
     payload = json.dumps([{"a": "g", "g": 1, "p": file_id}]).encode()
     req = urllib.request.Request(
@@ -240,7 +298,6 @@ def download_mega(url: str, dest: str, quiet: bool = False):
 
     dl_url = result[0]["g"]
 
-    # Download encrypted file
     req = urllib.request.Request(dl_url, headers={"User-Agent": USER_AGENT})
     with _open_url(dl_url, req=req, timeout=300) as resp:
         total = resp.headers.get("Content-Length")
@@ -260,17 +317,37 @@ def download_mega(url: str, dest: str, quiet: bool = False):
         _download_with_progress(resp, dest, total, transform=cipher.decrypt, quiet=quiet)
 
 
-def download_mediafire(url: str, dest: str, quiet: bool = False):
-    """Download from MediaFire using mediafiredl."""
-    from mediafiredl.MediafireDL import GetFileLink
+def _mediafire_direct_url(page_url: str) -> str:
+    """Fetch a MediaFire download page and extract the direct download link
+    (the href of the ``#downloadButton`` anchor).
 
-    # GetFileLink scrapes the download page for the direct link. On failure
-    # it does NOT raise: it prints the exception and returns the Exception
-    # object itself, so validate the return value instead of catching.
-    direct_url = GetFileLink(url)
-    if not (isinstance(direct_url, str) and direct_url.startswith("http")):
-        raise DownloadError(f"Could not extract MediaFire direct link for {url}")
-    download_direct(direct_url, dest, quiet=quiet)
+    The page HTML is untrusted: the extracted link is only followed when it
+    is an https URL on mediafire.com (or a subdomain). Uses a bounded
+    timeout and the same attribute parser as the Google Drive interstitial
+    handler.
+    """
+    req = urllib.request.Request(page_url, headers={"User-Agent": USER_AGENT})
+    with _open_url(page_url, req=req, timeout=30) as resp:
+        html = resp.read().decode("utf-8", errors="replace")
+
+    for tag in _ANCHOR_TAG_RE.findall(html):
+        attrs = _parse_html_attrs(tag)
+        if attrs.get("id") == "downloadButton":
+            href = (attrs.get("href") or "").replace("&amp;", "&")
+            if (
+                href.startswith("https://")
+                and _host_is(_url_hostname(href), "mediafire.com")
+            ):
+                return href
+            break
+
+    raise DownloadError(f"Could not extract MediaFire direct link for {page_url}")
+
+
+def download_mediafire(url: str, dest: str, quiet: bool = False):
+    """Download from MediaFire by scraping the direct link from the download
+    page, then fetching it like any direct URL."""
+    download_direct(_mediafire_direct_url(url), dest, quiet=quiet)
 
 
 def download_direct(url: str, dest: str, quiet: bool = False):
@@ -280,7 +357,9 @@ def download_direct(url: str, dest: str, quiet: bool = False):
     page that Drive serves instead of the file itself for large (~100 MB+)
     files: when the response for a Drive URL comes back as HTML, the
     confirmation form embedded in that page is parsed and re-submitted to
-    get the actual file.
+    get the actual file. The form's action URL is untrusted scraped HTML:
+    it is only followed when it is an https URL on google.com (or a
+    subdomain).
     """
     url = _convert_gdrive_url(url)
     gdrive = is_gdrive_url(url)
@@ -299,6 +378,15 @@ def download_direct(url: str, dest: str, quiet: bool = False):
                     "and the confirmation form could not be parsed."
                 )
             action, params = parsed
+            action_host = _url_hostname(action)
+            if (
+                not action.lower().startswith("https://")
+                or not _host_is(action_host, "google.com")
+            ):
+                raise DownloadError(
+                    "Refusing to follow Google Drive confirmation form to "
+                    f"unexpected destination: {action}"
+                )
             confirm_url = f"{action}?{urlencode(params)}"
             confirm_req = urllib.request.Request(confirm_url, headers={"User-Agent": USER_AGENT})
             with _open_url(confirm_url, req=confirm_req, timeout=120) as confirm_resp:
@@ -340,17 +428,34 @@ def pick_best_url(urls: list[str]) -> str:
     return urls[0]
 
 
+_SAFE_FILENAME_CHARS_RE = re.compile(r"[^A-Za-z0-9._-]")
+
+
+def safe_filename_component(name: str) -> str:
+    """Reduce an untrusted string (e.g. a model id from the API) to a single
+    safe filename component.
+
+    Strips any path components (both separators, so Windows-style paths are
+    covered too), collapses anything outside ``[A-Za-z0-9._-]`` to
+    underscores, and never returns a traversal segment (``.``/``..``) or a
+    hidden dotfile name.
+    """
+    seg = os.path.basename(str(name).replace("\\", "/"))
+    seg = _SAFE_FILENAME_CHARS_RE.sub("_", seg)
+    seg = seg.lstrip(".")
+    return seg or "_"
+
+
 def build_filename(url: str, model_id: str, file_ext: str) -> str:
     """Build a sane filename from URL, model ID, and extension."""
     url_filename = url.split("/")[-1].split("?")[0]
-    url_filename = os.path.basename(url_filename)  # prevent path traversal
+    url_filename = os.path.basename(url_filename)
     if url_filename and "." in url_filename and len(url_filename) > 3:
         if not url_filename.startswith("uc") and not url_filename.startswith("#"):
             return url_filename
-    return f"{model_id}.{file_ext}"
+    return f"{safe_filename_component(model_id)}.{safe_filename_component(file_ext)}"
 
-
-def fmt_size(b: int) -> str:
+def fmt_size(b: int | None) -> str:
     """Format bytes to human-readable size."""
     if not b:
         return "?"

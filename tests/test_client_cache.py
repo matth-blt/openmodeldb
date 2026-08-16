@@ -85,10 +85,10 @@ def test_expired_cache_falls_back_with_warning_on_urlerror(tmp_path, capsys, mon
 
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
 
-    models = db.models  # triggers _fetch() -> _fetch_remote() fails -> fallback
+    models = db.models
 
     assert db._raw_data == FIXTURE_DATA
-    assert len(models) == len(FIXTURE_DATA) - 1  # one fixture entry has an excluded arch
+    assert len(models) == len(FIXTURE_DATA) - 1
 
     captured = capsys.readouterr()
     assert captured.out == ""
@@ -119,10 +119,10 @@ def test_connection_reset_during_read_falls_back_with_warning(tmp_path, capsys, 
 
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
 
-    models = db.models  # triggers _fetch() -> _fetch_remote() fails mid-read -> fallback
+    models = db.models
 
     assert db._raw_data == FIXTURE_DATA
-    assert len(models) == len(FIXTURE_DATA) - 1  # one fixture entry has an excluded arch
+    assert len(models) == len(FIXTURE_DATA) - 1
 
     captured = capsys.readouterr()
     assert captured.out == ""
@@ -193,13 +193,11 @@ def test_304_reuses_cache_and_refreshes_mtime(tmp_path, monkeypatch):
 
     assert db._raw_data == FIXTURE_DATA
     assert len(captured_requests) == 1
-    # urllib.request.Request stores header keys via str.capitalize(), i.e.
-    # only the leading character is upper-cased ("If-none-match").
     assert captured_requests[0].get_header("If-none-match") == '"abc123"'
 
     mtime_after = os.path.getmtime(cache_file)
     assert mtime_after > mtime_before
-    assert (time.time() - mtime_after) < 5  # freshly refreshed
+    assert (time.time() - mtime_after) < 5
 
 
 def test_200_stores_meta_sidecar_when_headers_present(tmp_path, monkeypatch):
@@ -233,11 +231,10 @@ def test_corrupt_cache_file_is_discarded_and_refetched(tmp_path, monkeypatch):
 
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
 
-    db.models  # cache file has invalid JSON but a "valid" (fresh) mtime
+    db.models
 
     assert db._raw_data == FIXTURE_DATA
 
-    # Cache file should now contain valid, parseable data.
     cache_file = tmp_path / "cache" / "models.json"
     with open(cache_file, "r", encoding="utf-8") as f:
         assert json.load(f) == FIXTURE_DATA

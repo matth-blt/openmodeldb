@@ -6,18 +6,44 @@ Conversion utilities for OpenModelDB.
 """
 
 import os
+import re
 import time
+import warnings
+
+from openmodeldb.exceptions import UnsafeModelError
+
+# DOCS
+# https://github.com/advisories/GHSA-53q9-r3pm-6pq6 (CVE-2025-32434)
+_MIN_SAFE_TORCH = (2, 6, 0)
+
+
+def _check_torch_safety():
+    """Warn when the installed torch predates the CVE-2025-32434 fix."""
+    import torch
+
+    m = re.match(r"(\d+)\.(\d+)\.(\d+)", getattr(torch, "__version__", "") or "")
+    version = tuple(int(g) for g in m.groups()) if m else (0, 0, 0)
+    if version < _MIN_SAFE_TORCH:
+        warnings.warn(
+            f"torch {torch.__version__} is older than 2.6.0 and affected by "
+            "CVE-2025-32434: torch.load(weights_only=True) can be bypassed "
+            "with a crafted model file, leading to arbitrary code execution. "
+            "Upgrade torch (pip install -U torch) before loading untrusted "
+            "models.",
+            UserWarning,
+        )
 
 
 def _check_dependencies():
     """Check that ONNX conversion dependencies are installed."""
     missing = []
     try:
-        import torch  # noqa: F401
+        import torch
+        _check_torch_safety()
     except ImportError:
         missing.append("torch")
     try:
-        import onnx  # noqa: F401
+        import onnx
     except ImportError:
         missing.append("onnx")
     try:
@@ -67,6 +93,7 @@ def convert_format(
         import torch
     except ImportError:
         raise ImportError("torch is required for format conversion. pip install torch")
+    _check_torch_safety()
 
     target = target.lower().lstrip(".")
     base_name = os.path.basename(model_path)
@@ -93,14 +120,14 @@ def convert_format(
         else:
             try:
                 state_dict = torch.load(model_path, map_location="cpu", weights_only=True)
-            except Exception:
-                import warnings
-                warnings.warn(
-                    f"{model_path}: falling back to unsafe pickle load (weights_only=False); "
-                    f"only do this for files you trust",
-                    UserWarning,
-                )
-                state_dict = torch.load(model_path, map_location="cpu", weights_only=False)
+            except Exception as e:
+                raise UnsafeModelError(
+                    f"{base_name}: cannot be loaded safely (weights_only): {e}. "
+                    "The file may be malicious or use legacy pickle features; "
+                    "refusing to fall back to an unsafe pickle load. If you "
+                    "trust this file, load it manually with "
+                    "torch.load(..., weights_only=False)."
+                ) from e
             # Handle nested state dicts (e.g. {"state_dict": {...}, "params_ema": {...}})
             if isinstance(state_dict, dict):
                 for key in ("params_ema", "params", "state_dict", "model", "model_state_dict"):
@@ -156,6 +183,7 @@ def compare_weights(
         import torch
     except ImportError:
         raise ImportError("torch is required for weight comparison. pip install torch")
+    _check_torch_safety()
 
     def _load(path: str) -> dict[str, "torch.Tensor"]:
         ext = os.path.splitext(path)[1].lower()
@@ -172,14 +200,14 @@ def compare_weights(
             }
         try:
             sd = torch.load(path, map_location="cpu", weights_only=True)
-        except Exception:
-            import warnings
-            warnings.warn(
-                f"{path}: falling back to unsafe pickle load (weights_only=False); "
-                f"only do this for files you trust",
-                UserWarning,
-            )
-            sd = torch.load(path, map_location="cpu", weights_only=False)
+        except Exception as e:
+            raise UnsafeModelError(
+                f"{os.path.basename(path)}: cannot be loaded safely (weights_only): {e}. "
+                "The file may be malicious or use legacy pickle features; "
+                "refusing to fall back to an unsafe pickle load. If you "
+                "trust this file, load it manually with "
+                "torch.load(..., weights_only=False)."
+            ) from e
         if isinstance(sd, dict):
             for key in ("params_ema", "params", "state_dict", "model", "model_state_dict"):
                 if key in sd and isinstance(sd[key], dict):
@@ -192,7 +220,6 @@ def compare_weights(
 
     common = set(weights_a.keys()) & set(weights_b.keys())
     if not common:
-        # No shared keys — try matching by shape (ONNX renames layers)
         by_shape_a = {}
         for k, v in weights_a.items():
             key = (tuple(v.shape), v.dtype)
@@ -289,13 +316,19 @@ def convert_to_onnx(
     Convert a PyTorch model (.pth / .safetensors) to ONNX.
 
     Args:
-        model_path: Path to the source PyTorch model file.
-        output_path: Path for the output ONNX file.
-                     If None, replaces the extension with .onnx in the same directory.
-        opset: ONNX opset version (default: 20).
-        half: If True, convert to FP16. Otherwise FP32.
-        optimize: If True, apply ORT graph optimizations.
-        quiet: If True, suppress all output.
+        model_path: 
+            Path to the source PyTorch model file.
+        output_path: 
+            Path for the output ONNX file.
+            If None, replaces the extension with .onnx in the same directory.
+        opset: 
+            ONNX opset version (default: 20).
+        half: 
+            If True, convert to FP16. Otherwise FP32.
+        optimize: 
+            If True, apply ORT graph optimizations.
+        quiet: 
+            If True, suppress all output.
 
     Returns:
         Path to the saved ONNX file.
@@ -319,14 +352,12 @@ def convert_to_onnx(
         if not quiet:
             status.update(f"  Loading {base_name}...")
 
-        # Install extra architecture support if available
         try:
             import spandrel_extra_arches
             spandrel_extra_arches.install()
         except ImportError:
             pass
 
-        # Suppress spandrel's verbose weight dump during loading
         with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
             loader = ModelLoader()
             model_desc = loader.load_from_file(model_path)
@@ -335,11 +366,9 @@ def convert_to_onnx(
             f"Unsupported model type: expected ImageModelDescriptor, got {type(model_desc).__name__}"
         )
 
-        # Extract the raw nn.Module and prepare for export
         model = model_desc.model.to("cpu").eval()
-        model.requires_grad_(False)  # Detach all gradients for ONNX export
+        model.requires_grad_(False)
 
-        # Check FP16 support
         if half and not model_desc.supports_half:
             if not quiet:
                 print(
@@ -349,21 +378,18 @@ def convert_to_onnx(
             half = False
             precision = "FP32"
 
-        # Determine output path
         if output_path is None:
             base = os.path.splitext(model_path)[0]
             output_path = f"{base}.onnx"
 
         os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
 
-        # Dummy input — use FP16 if half (PyTorch-level conversion, more reliable)
         if half:
             model = model.half()
             torch_input = torch.randn(1, model_desc.input_channels, 32, 32, device="cpu", dtype=torch.float16)
         else:
             torch_input = torch.randn(1, model_desc.input_channels, 32, 32, device="cpu")
 
-        # Wrap the raw nn.Module (fixes issues with various architectures, from chaiNNer)
         class _SpandrelWrapper(torch.nn.Module):
             def __init__(self, m: torch.nn.Module):
                 super().__init__()
@@ -380,16 +406,9 @@ def convert_to_onnx(
 
         start = time.time()
 
-        # Suppress TracerWarnings (noisy but harmless)
         warnings.filterwarnings("ignore", category=torch.jit.TracerWarning)
         warnings.filterwarnings("ignore", message=".*TrainingMode.EVAL.*")
 
-        # Patch torch.sort ONNX symbolic: the built-in handler wrongly
-        # treats the `stable` kwarg as the `out` parameter and rejects it.
-        # We monkey-patch _sort_helper to ignore `out` and just do TopK.
-        # `_sort_helper` is a private torch API and may be renamed/removed in
-        # future torch releases — guard the patch so export still proceeds
-        # (unpatched) if it's gone.
         from torch.onnx import symbolic_helper as _sh
 
         _sort_helper_patched = False
@@ -448,7 +467,6 @@ def convert_to_onnx(
             ort.InferenceSession(output_path, session_opt, providers=["CPUExecutionProvider"])
             os.replace(optimized_path, output_path)
 
-    # Final summary (outside the spinner)
     if not quiet:
         size_mb = os.path.getsize(output_path) / 1048576
         print(

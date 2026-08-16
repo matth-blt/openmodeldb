@@ -2,9 +2,11 @@
 Tests for the pure/offline-safe helpers in openmodeldb.downloader.
 
 None of these exercise smart_download/download_mega/download_mediafire/
-download_direct: those perform network I/O and are out of scope for this
-task (they'll be covered later via monkeypatching urllib/mediafiredl).
+download_direct: those perform network I/O and are covered in
+test_download_robustness.py via monkeypatched urllib.
 """
+import re
+
 from openmodeldb.downloader import (
     _convert_gdrive_url,
     build_filename,
@@ -13,6 +15,7 @@ from openmodeldb.downloader import (
     is_mediafire_url,
     is_mega_url,
     pick_best_url,
+    safe_filename_component,
 )
 
 # ─── pick_best_url ──────────────────────────────────────────────────────
@@ -86,10 +89,41 @@ def test_build_filename_falls_back_for_extensionless_url():
 
 
 def test_build_filename_falls_back_for_short_filename():
-    # A "filename" of length <= 3 (e.g. just an extension-looking blob)
-    # isn't trusted; falls back to model_id.ext.
     url = "https://example.com/a.b"
     assert build_filename(url, "my-model", "pth") == "my-model.pth"
+
+
+def test_build_filename_suspicious_extension_fallback_is_sanitized():
+    url = "https://example.com/download"
+    fn = build_filename(url, "my-model", "../evil")
+    assert fn == "my-model.evil"
+
+
+# ─── safe_filename_component (untrusted model ids/extensions) ──────────
+
+def test_safe_filename_component_returns_simple_names_unchanged():
+    assert safe_filename_component("4xNomos8k_atd_jpg") == "4xNomos8k_atd_jpg"
+    assert safe_filename_component("4x-AnimeJaNai.v2") == "4x-AnimeJaNai.v2"
+
+
+def test_safe_filename_component_strips_path_traversal():
+    assert safe_filename_component("../../.cache/openmodeldb/models.json") == "models.json"
+    assert safe_filename_component("sub/../../4xNomos8k") == "4xNomos8k"
+    assert safe_filename_component("a\\..\\..\\b") == "b"
+
+
+def test_safe_filename_component_never_returns_traversal_or_hidden():
+    for evil in ("..", ".", "...", ".bashrc", "", "/"):
+        out = safe_filename_component(evil)
+        assert out not in ("", ".", ".."), evil
+        assert not out.startswith("."), evil
+        assert "/" not in out and "\\" not in out, evil
+
+
+def test_safe_filename_component_replaces_unsafe_characters():
+    out = safe_filename_component("4x Nomos (hd); rm -rf")
+    assert out == "4x_Nomos__hd___rm_-rf"
+    assert re.fullmatch(r"[A-Za-z0-9._-]+", out)
 
 
 # ─── fmt_size ────────────────────────────────────────────────────────────
@@ -134,6 +168,21 @@ def test_is_mediafire_url():
 def test_is_gdrive_url():
     assert is_gdrive_url("https://drive.google.com/file/d/abc123/view") is True
     assert is_gdrive_url("https://example.com/model.pth") is False
+
+
+def test_host_detectors_match_hostname_not_substring():
+    assert is_gdrive_url("https://evil.com/drive.google.com/x") is False
+    assert is_gdrive_url("https://evil.com/?next=drive.google.com") is False
+    assert is_mediafire_url("https://evil.com/mediafire.com/x") is False
+    assert is_mediafire_url("https://evil.com/?u=mediafire.com") is False
+    assert is_mega_url("https://evil.com/mega.nz/file") is False
+    assert is_mega_url("https://evil.com/?file=mega.nz") is False
+
+
+def test_host_detectors_accept_subdomains():
+    assert is_mediafire_url("https://download123.mediafire.com/abc") is True
+    assert is_gdrive_url("https://drive.usercontent.google.com/download?id=x") is True
+    assert is_mega_url("https://g123.mega.co.nz/file") is True
 
 
 # ─── _convert_gdrive_url ──────────────────────────────────────────────────

@@ -1,10 +1,10 @@
 """
 Tests for downloader robustness: atomic writes, network error wrapping,
-and the Google Drive "can't scan for viruses" interstitial fix.
+the Google Drive "can't scan for viruses" interstitial fix, and the
+MediaFire direct-link scraper.
 
-All network I/O is faked by monkeypatching urllib.request.urlopen (and, for
-MediaFire, mediafiredl.MediafireDL.GetFileLink) with lightweight stand-ins.
-No real network access happens in this file.
+All network I/O is faked by monkeypatching urllib.request.urlopen with
+lightweight stand-ins. No real network access happens in this file.
 """
 import base64
 import json
@@ -12,7 +12,6 @@ import os
 import urllib.error
 import urllib.request
 
-import mediafiredl.MediafireDL
 import pytest
 
 from openmodeldb import (
@@ -26,6 +25,7 @@ from openmodeldb.downloader import (
     download_direct,
     download_mediafire,
     download_mega,
+    smart_download,
 )
 
 # ─── Fakes ───────────────────────────────────────────────────────────────
@@ -127,8 +127,6 @@ def test_download_with_progress_failure_leaves_no_dest_no_part(tmp_path):
 
 
 def test_download_with_progress_failure_does_not_clobber_existing_file(tmp_path):
-    # A previously-completed download at dest must survive an unrelated
-    # failed re-download attempt (since we never touch dest until success).
     dest = str(tmp_path / "model.pth")
     with open(dest, "wb") as f:
         f.write(b"already-complete-file")
@@ -189,8 +187,12 @@ def test_download_direct_normal_path_still_works(monkeypatch, tmp_path):
     payload = b"totally-a-model-file"
 
     def fake_urlopen(req, timeout=None):
-        return _FakeResp(payload, headers={"Content-Type": "application/octet-stream",
-                                            "Content-Length": str(len(payload))})
+        return _FakeResp(
+            payload, headers={
+                "Content-Type": "application/octet-stream",
+                "Content-Length": str(len(payload))
+            }
+        )
 
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
 
@@ -213,7 +215,6 @@ def test_download_mega_api_error_raises_download_error(monkeypatch, tmp_path):
     url = f"https://mega.nz/file/FILEID#{_mega_key_str()}"
 
     def fake_urlopen(req, timeout=None):
-        # Mega's API returns a bare negative int on error.
         return _FakeResp(json.dumps(-9).encode())
 
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
@@ -235,52 +236,212 @@ def test_download_mega_wraps_urlerror(monkeypatch, tmp_path):
     assert isinstance(exc_info.value.__cause__, urllib.error.URLError)
 
 
-# ─── download_mediafire error wrapping ─────────────────────────────────
+# ─── download_mediafire: direct-link scraper ───────────────────────────
 #
-# mediafiredl's real API is `mediafiredl.MediafireDL.GetFileLink(url)`.
-# downloader.py imports it lazily inside download_mediafire, so patching
-# the symbol on the mediafiredl.MediafireDL module (where it's looked up
-# at call time) intercepts the call.
+# download_mediafire fetches the MediaFire download page itself (bounded
+# timeout), parses the #downloadButton anchor's href, and downloads that
+# direct URL. urlopen is faked: first call serves the HTML page, the
+# second serves the file.
+
+MEDIAFIRE_PAGE_HTML = """<!DOCTYPE html>
+<html><body>
+<a id="downloadButton" class="download" href="https://download123.mediafire.com/abc123/model.pth">Download</a>
+</body></html>"""
+
+# Same page, but attributes in the other order and an escaped ampersand in
+# the URL (as real MediaFire pages serve it).
+MEDIAFIRE_PAGE_HTML_REVERSED = """<html><body>
+<a href="https://download99.mediafire.com/x?a=1&amp;b=2" id="downloadButton">Download</a>
+</body></html>"""
+
+MEDIAFIRE_PAGE_NO_BUTTON = "<html><body><p>file not found</p></body></html>"
+
+MEDIAFIRE_PAGE_JS_HREF = (
+    '<html><body><a id="downloadButton" href="javascript:void(0)">Download</a></body></html>'
+)
+
+
+def _fake_mediafire_urlopen(monkeypatch, page_html: str, payload: bytes):
+    calls = []
+
+    def fake_urlopen(req, timeout=None):
+        calls.append(req.full_url)
+        if len(calls) == 1:
+            return _FakeResp(
+                page_html.encode(),
+                headers={"Content-Type": "text/html; charset=utf-8"},
+            )
+        return _FakeResp(
+            payload,
+            headers={
+                "Content-Type": "application/octet-stream",
+                "Content-Length": str(len(payload))
+            },
+        )
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    return calls
+
 
 def test_download_mediafire_success_path(monkeypatch, tmp_path):
     payload = b"mediafire-model-bytes"
-    direct = "https://download123.mediafire.com/abc/model.pth"
-    seen = {}
-
-    monkeypatch.setattr(mediafiredl.MediafireDL, "GetFileLink", lambda url: direct)
-
-    def fake_urlopen(req, timeout=None):
-        seen["url"] = req.full_url
-        return _FakeResp(payload, headers={"Content-Type": "application/octet-stream",
-                                            "Content-Length": str(len(payload))})
-
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    calls = _fake_mediafire_urlopen(monkeypatch, MEDIAFIRE_PAGE_HTML, payload)
 
     dest = str(tmp_path / "model.pth")
     download_mediafire("https://www.mediafire.com/file/xyz/model.pth", dest, quiet=True)
 
-    assert seen["url"] == direct
+    assert calls[0] == "https://www.mediafire.com/file/xyz/model.pth"
+    assert calls[1] == "https://download123.mediafire.com/abc123/model.pth"
     with open(dest, "rb") as f:
         assert f.read() == payload
 
 
-def test_download_mediafire_exception_object_return_raises_download_error(monkeypatch, tmp_path):
-    # GetFileLink doesn't raise on failure: it prints the exception and
-    # RETURNS the Exception object. That must count as a failed extraction.
-    monkeypatch.setattr(
-        mediafiredl.MediafireDL, "GetFileLink",
-        lambda url: AttributeError("'NoneType' object has no attribute 'get'"),
+def test_download_mediafire_attribute_order_and_entity_escaping(monkeypatch, tmp_path):
+    payload = b"model-bytes"
+    calls = _fake_mediafire_urlopen(
+        monkeypatch, MEDIAFIRE_PAGE_HTML_REVERSED, payload
+    )
+
+    dest = str(tmp_path / "model.pth")
+    download_mediafire("https://www.mediafire.com/file/xyz/model.pth", dest, quiet=True)
+
+    assert calls[1] == "https://download99.mediafire.com/x?a=1&b=2"
+    with open(dest, "rb") as f:
+        assert f.read() == payload
+
+
+def test_download_mediafire_page_without_button_raises(monkeypatch, tmp_path):
+    def fake_urlopen(req, timeout=None):
+        return _FakeResp(
+            MEDIAFIRE_PAGE_NO_BUTTON.encode(),
+            headers={"Content-Type": "text/html; charset=utf-8"},
+        )
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+    with pytest.raises(DownloadError, match="[Mm]edia[Ff]ire"):
+        download_mediafire(
+            "https://www.mediafire.com/file/xyz/model.pth",
+            str(tmp_path / "model.pth"),
+        )
+
+
+def test_download_mediafire_non_http_href_raises(monkeypatch, tmp_path):
+    def fake_urlopen(req, timeout=None):
+        return _FakeResp(
+            MEDIAFIRE_PAGE_JS_HREF.encode(),
+            headers={"Content-Type": "text/html; charset=utf-8"},
+        )
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+    with pytest.raises(DownloadError):
+        download_mediafire(
+            "https://www.mediafire.com/file/xyz/model.pth",
+            str(tmp_path / "model.pth"),
+        )
+
+
+# ─── URL scheme allowlist ──────────────────────────────────────────────
+
+def test_smart_download_rejects_file_scheme_without_network(monkeypatch, tmp_path):
+    def fake_urlopen(req, timeout=None):
+        raise AssertionError("urlopen must not be called for a rejected scheme")
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+    with pytest.raises(DownloadError, match="scheme"):
+        smart_download("file:///etc/passwd", str(tmp_path / "leak"))
+
+
+def test_smart_download_rejects_ftp_scheme(monkeypatch, tmp_path):
+    def fake_urlopen(req, timeout=None):
+        raise AssertionError("urlopen must not be called for a rejected scheme")
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+    with pytest.raises(DownloadError, match="scheme"):
+        smart_download("ftp://evil.com/model.pth", str(tmp_path / "m.pth"))
+
+
+# ─── scraped-URL destination validation ────────────────────────────────
+
+GDRIVE_INTERSTITIAL_EVIL_ACTION = """<!DOCTYPE html>
+<html><body>
+<form id="download-form" action="https://evil.com/exfil" method="get">
+<input type="hidden" name="id" value="FILEID123">
+</form>
+</body></html>"""
+
+GDRIVE_INTERSTITIAL_FILE_ACTION = """<!DOCTYPE html>
+<html><body>
+<form id="download-form" action="file:///etc/passwd" method="get">
+<input type="hidden" name="id" value="FILEID123">
+</form>
+</body></html>"""
+
+
+def _serve_first_response(monkeypatch, body: bytes, content_type: str):
+    def fake_urlopen(req, timeout=None):
+        return _FakeResp(body, headers={"Content-Type": content_type})
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+
+def test_gdrive_interstitial_action_to_foreign_host_rejected(monkeypatch, tmp_path):
+    _serve_first_response(
+        monkeypatch,
+        GDRIVE_INTERSTITIAL_EVIL_ACTION.encode(),
+        "text/html; charset=utf-8",
+    )
+
+    with pytest.raises(DownloadError, match="[Rr]efus"):
+        download_direct(
+            "https://drive.google.com/file/d/FILEID123/view",
+            str(tmp_path / "m.pth"),
+        )
+
+
+def test_gdrive_interstitial_action_to_file_scheme_rejected(monkeypatch, tmp_path):
+    _serve_first_response(
+        monkeypatch,
+        GDRIVE_INTERSTITIAL_FILE_ACTION.encode(),
+        "text/html; charset=utf-8",
     )
 
     with pytest.raises(DownloadError):
-        download_mediafire("https://www.mediafire.com/file/xyz/model.pth", str(tmp_path / "model.pth"))
+        download_direct(
+            "https://drive.google.com/file/d/FILEID123/view",
+            str(tmp_path / "m.pth"),
+        )
 
 
-def test_download_mediafire_non_http_string_raises_download_error(monkeypatch, tmp_path):
-    monkeypatch.setattr(mediafiredl.MediafireDL, "GetFileLink", lambda url: "javascript:void(0)")
+def test_mediafire_href_to_foreign_host_rejected(monkeypatch, tmp_path):
+    html = (
+        '<html><body><a id="downloadButton" '
+        'href="https://evil.com/steal">Download</a></body></html>'
+    )
+    _serve_first_response(monkeypatch, html.encode(), "text/html; charset=utf-8")
 
     with pytest.raises(DownloadError):
-        download_mediafire("https://www.mediafire.com/file/xyz/model.pth", str(tmp_path / "model.pth"))
+        download_mediafire(
+            "https://www.mediafire.com/file/xyz/model.pth",
+            str(tmp_path / "m.pth"),
+        )
+
+
+def test_mediafire_http_href_downgrade_rejected(monkeypatch, tmp_path):
+    html = (
+        '<html><body><a id="downloadButton" '
+        'href="http://download123.mediafire.com/abc">Download</a></body></html>'
+    )
+    _serve_first_response(monkeypatch, html.encode(), "text/html; charset=utf-8")
+
+    with pytest.raises(DownloadError):
+        download_mediafire(
+            "https://www.mediafire.com/file/xyz/model.pth",
+            str(tmp_path / "m.pth"),
+        )
 
 
 # ─── Google Drive interstitial fix ─────────────────────────────────────
@@ -298,8 +459,10 @@ def test_download_direct_gdrive_interstitial_is_followed(monkeypatch, tmp_path):
             )
         return _FakeResp(
             payload,
-            headers={"Content-Type": "application/octet-stream",
-                     "Content-Length": str(len(payload))},
+            headers={
+                "Content-Type": "application/octet-stream",
+                "Content-Length": str(len(payload))
+            },
         )
 
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
@@ -308,8 +471,6 @@ def test_download_direct_gdrive_interstitial_is_followed(monkeypatch, tmp_path):
     download_direct("https://drive.google.com/file/d/FILEID123/view", dest, quiet=True)
 
     assert len(calls) == 2
-    # Second request must hit the parsed form action host with the
-    # confirmation params, not the original uc?export=download URL.
     assert calls[1].startswith("https://drive.usercontent.google.com/download?")
     assert "confirm=t" in calls[1]
     assert "uuid=abc-def-uuid" in calls[1]

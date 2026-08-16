@@ -3,7 +3,11 @@ Tests for openmodeldb.client.OpenModelDB query/lookup behavior, backed by
 the offline `db` fixture (tests/conftest.py) built from
 tests/fixtures/models.json. No network access.
 """
+import json
+import os
+import time
 
+from openmodeldb import OpenModelDB
 
 # ─── find() ──────────────────────────────────────────────────────────────
 
@@ -58,8 +62,6 @@ def test_find_no_match(db):
 
 
 def test_find_excludes_cain(db):
-    # cain is excluded at load time; even an unfiltered find() must never
-    # surface it.
     ids = {m.id for m in db.find()}
     assert "cain-excluded-model" not in ids
 
@@ -161,7 +163,6 @@ def test_getitem_exact_name_case_insensitive(db):
 
 
 def test_len(db):
-    # 7 fixture entries minus the 1 excluded "cain" architecture model.
     assert len(db) == 6
 
 
@@ -180,3 +181,35 @@ def test_list_author_joined_to_comma_string(db):
 def test_single_string_author_unchanged(db):
     model = db["4x-ExamplePth"]
     assert model.author == "alice"
+
+
+# ─── terminal-injection sanitization ────────────────────────────────────
+
+def test_model_fields_strip_terminal_control_sequences(tmp_path):
+    """Names/descriptions/tags come from the remote DB: escape sequences
+    (ANSI, OSC clipboard/title tricks) must never reach the terminal."""
+    payload = {
+        "4x-Evil": {
+            "name": "Evil\x1b]52;c;pwned\x07Net",
+            "author": "mallory\x1b[A",
+            "architecture": "esrgan",
+            "scale": 4,
+            "license": "MIT\x1b[2K",
+            "tags": ["photo", "tag\x1b]0;title\x07"],
+            "description": "desc with \x9b31m control\x00 chars",
+            "resources": [],
+        }
+    }
+    cache_dir = tmp_path
+    cache_file = cache_dir / "models.json"
+    with open(cache_file, "w") as f:
+        json.dump(payload, f)
+    now = time.time()
+    os.utime(cache_file, (now, now))
+
+    db = OpenModelDB(cache_dir=str(cache_dir), download_dir=str(tmp_path / "d"))
+    m = db["4x-Evil"]
+
+    for field in (m.id, m.name, m.author, m.license, m.description):
+        assert "\x1b" not in field and "\x9b" not in field and "\x00" not in field
+    assert all("\x1b" not in t and "\x9b" not in t for t in m.tags)

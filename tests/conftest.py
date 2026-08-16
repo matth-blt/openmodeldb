@@ -25,8 +25,6 @@ def db(tmp_path):
     cache_dir = tmp_path
     cache_file = cache_dir / "models.json"
     shutil.copyfile(MODELS_FIXTURE, cache_file)
-    # Ensure a fresh mtime so OpenModelDB._cache_is_valid() is True and the
-    # client never attempts to hit the network.
     now = time.time()
     os.utime(cache_file, (now, now))
 

@@ -6,15 +6,14 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
+from typing import overload
 
-# Exceptions live in openmodeldb.exceptions; re-imported here so existing
-# code doing `from openmodeldb.client import DownloadError` (etc.) keeps
-# working.
 from openmodeldb.downloader import USER_AGENT
 from openmodeldb.exceptions import (
     DownloadError,
@@ -22,12 +21,36 @@ from openmodeldb.exceptions import (
     ModelNotFoundError,
     OpenModelDBError,
 )
+from openmodeldb.exceptions import UnsafeModelError as UnsafeModelError
 
 API_URL = "https://openmodeldb.info/api/v1/models.json"
 DEFAULT_CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "openmodeldb")
 DEFAULT_DOWNLOAD_DIR = os.path.join(os.getcwd(), "downloads")
 CACHE_MAX_AGE = 3600
 EXCLUDED_ARCHS = {"cain", "cain-yuv"}
+
+# Zip-bomb guard: refuse to extract more than ZIP_MAX_EXPANSION_RATIO times
+# the archive's size (with an absolute floor for tiny archives). Model
+# weights barely compress, so legitimate archives stay far below this.
+ZIP_MAX_EXPANSION_RATIO = 100
+ZIP_MIN_EXPANSION_LIMIT = 1 << 30  # 1 GiB
+
+
+def _zip_expansion_limit(archive_size: int) -> int:
+    return max(archive_size * ZIP_MAX_EXPANSION_RATIO, ZIP_MIN_EXPANSION_LIMIT)
+
+
+# C0/C1 control characters (ANSI/OSC escape sequences included) — remote
+# data must never reach the terminal raw: OSC 52 can touch the clipboard,
+# OSC 0/2 rewrite the window title, CSI sequences move/clear the screen.
+_TERMINAL_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
+
+
+def _sanitize_text(value):
+    """Strip terminal control sequences from untrusted remote strings."""
+    if isinstance(value, str):
+        return _TERMINAL_CONTROL_RE.sub("", value)
+    return value
 
 
 @dataclass
@@ -158,8 +181,6 @@ class OpenModelDB:
         OpenModelDBError.
         """
         headers = {"User-Agent": USER_AGENT}
-        # Only attempt a conditional request if we actually have a cache
-        # file to fall back on for a 304 response.
         meta = self._load_meta() if os.path.exists(self._cache_file) else None
         if meta:
             etag = meta.get("etag")
@@ -176,7 +197,6 @@ class OpenModelDB:
                 resp_headers = resp.headers
         except urllib.error.HTTPError as e:
             if e.code == 304:
-                # Server confirms our cache is still current.
                 now = time.time()
                 os.utime(self._cache_file, (now, now))
                 try:
@@ -191,9 +211,6 @@ class OpenModelDB:
         except TimeoutError as e:
             raise OpenModelDBError(f"Timed out while fetching {API_URL}: {e}") from e
         except (OSError, http.client.HTTPException) as e:
-            # Covers connection drops mid-read (ConnectionResetError) and
-            # truncated bodies (http.client.IncompleteRead), neither of
-            # which is a URLError/HTTPError.
             raise OpenModelDBError(f"Connection error while fetching {API_URL}: {e}") from e
 
         try:
@@ -221,7 +238,6 @@ class OpenModelDB:
                 self._raw_data = self._load_cache()
                 return self._raw_data
             except json.JSONDecodeError:
-                # Corrupt cache: treat as no cache and fall through to refetch.
                 self._discard_cache()
 
         try:
@@ -231,14 +247,10 @@ class OpenModelDB:
                 try:
                     data = self._load_cache()
                 except json.JSONDecodeError:
-                    # Cache is also corrupt; nothing usable to fall back to.
                     self._discard_cache()
                     raise
                 mtime = os.path.getmtime(self._cache_file)
                 date_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(mtime))
-                # Prefer the wrapped exception's own message (e.g. the
-                # underlying URLError/JSONDecodeError) as the brief reason,
-                # since it's more specific than the generic wrapper text.
                 reason = str(e.__cause__) if e.__cause__ is not None else str(e)
                 print(
                     f"warning: failed to fetch openmodeldb API ({reason}), "
@@ -276,21 +288,22 @@ class OpenModelDB:
         raw = self._fetch()
         models = []
         for model_id, data in raw.items():
-            arch = (data.get("architecture") or "other").lower()
+            arch = _sanitize_text(data.get("architecture") or "other").lower()
             if not self._include_all and arch in EXCLUDED_ARCHS:
                 continue
             author = data.get("author", "unknown")
             if isinstance(author, list):
                 author = ", ".join(author)
+            tags = [_sanitize_text(t) for t in data.get("tags", [])]
             models.append(Model(
-                id=model_id,
-                name=data.get("name", model_id),
-                author=str(author),
+                id=_sanitize_text(model_id),
+                name=_sanitize_text(data.get("name", model_id)),
+                author=_sanitize_text(str(author)),
                 architecture=arch,
                 scale=data.get("scale", 0),
-                license=data.get("license", ""),
-                tags=data.get("tags", []),
-                description=data.get("description", ""),
+                license=_sanitize_text(data.get("license", "")),
+                tags=tags,
+                description=_sanitize_text(data.get("description", "")),
                 resources=data.get("resources", []),
                 data=data,
             ))
@@ -372,6 +385,7 @@ class OpenModelDB:
             List of matching Model objects.
         """
         from rich.console import Console
+        from rich.markup import escape
         from rich.table import Table
 
         results = self.find(scale=scale, architecture=architecture, tag=tag)
@@ -396,18 +410,17 @@ class OpenModelDB:
                 tags += f" +{len(m.tags) - 3}"
             table.add_row(
                 str(i),
-                m.name,
-                m.author,
-                m.architecture,
+                escape(m.name),
+                escape(m.author),
+                escape(m.architecture),
                 f"{m.scale}x",
-                tags,
+                escape(tags),
             )
 
         console = Console()
         console.print()
         console.print(table)
 
-        # Summary line
         filters = []
         if scale is not None:
             filters.append(f"x{scale}")
@@ -463,11 +476,9 @@ class OpenModelDB:
         first one.
         """
         q = name.lower()
-        # Exact match first
         for m in self.models:
             if m.id.lower() == q or m.name.lower() == q:
                 return m
-        # Partial match: collect every candidate before deciding.
         partial = [m for m in self.models if q in m.name.lower() or q in m.id.lower()]
         if len(partial) == 1:
             return partial[0]
@@ -519,12 +530,10 @@ class OpenModelDB:
 
     def _find_convertible_resource(self, model: Model) -> dict:
         """Find a pth or safetensors resource suitable for ONNX conversion."""
-        # Prefer pth, then safetensors
         for preferred in ("pth", "safetensors"):
             for res in model.resources:
                 if res.get("type", "").lower() == preferred:
                     return res
-        # Fallback to first non-onnx resource
         for res in model.resources:
             if res.get("type", "").lower() != "onnx":
                 return res
@@ -536,22 +545,40 @@ class OpenModelDB:
         """Check if a URL points to a zip archive."""
         return url.split("?")[0].lower().endswith(".zip")
 
+    @overload
+    def _extract_from_zip(
+        self, zip_path: str, res: dict, dest_dir: str, target_ext: None = None,
+    ) -> str: ...
+
+    @overload
+    def _extract_from_zip(
+        self, zip_path: str, res: dict, dest_dir: str, target_ext: str,
+    ) -> str | None: ...
+
     def _extract_from_zip(
         self, zip_path: str, res: dict, dest_dir: str, target_ext: str | None = None,
     ) -> str | None:
         """Extract a model file from a zip archive.
 
         Args:
-            zip_path: Path to the zip file.
-            res: Resource dict (with 'size' and 'type').
-            dest_dir: Directory to write the extracted file.
-            target_ext: If set (e.g. ".onnx"), look for a sibling file with this
-                        extension instead of the resource's own type.
-                        Returns None if no such file is found.
+            zip_path: 
+                Path to the zip file.
+            res: 
+                Resource dict (with 'size' and 'type').
+            dest_dir: 
+                Directory to write the extracted file.
+            target_ext: 
+                If set (e.g. ".onnx"), look for a sibling file with this
+                extension instead of the resource's own type.
+                Returns None if no such file is found. Sibling files
+                are not sha256-checked: the API's hash covers the
+                resource's own file only.
 
         Returns:
             Path to the extracted file, or None when target_ext is set and
-            no matching file was found.
+            no matching file was found. When *res* carries a ``sha256`` and
+            ``target_ext`` is None, the extracted file is verified against it
+            (mismatch raises DownloadError and removes the file and archive).
 
         Raises:
             DownloadError: When target_ext is not set and no file can be found.
@@ -559,10 +586,24 @@ class OpenModelDB:
         import shutil
         import zipfile
 
+        from openmodeldb.downloader import verify_sha256
+
         expected_size = res.get("size")
         expected_ext = f".{res.get('type', 'pth')}"
+        expected_sha = res.get("sha256")
+        expansion_limit = _zip_expansion_limit(os.path.getsize(zip_path))
+
+        def _check_expansion(entry, extra: int = 0):
+            if entry.file_size + extra > expansion_limit:
+                raise DownloadError(
+                    f"Refusing to extract {os.path.basename(entry.filename)} "
+                    f"({entry.file_size} bytes) from {os.path.basename(zip_path)} "
+                    f"({os.path.getsize(zip_path)} bytes): exceeds expansion "
+                    f"limit {expansion_limit} bytes (possible zip bomb)."
+                )
 
         def _write(zf, info):
+            _check_expansion(info)
             out_name = os.path.basename(info.filename)
             out_path = os.path.join(dest_dir, out_name)
             os.makedirs(dest_dir, exist_ok=True)
@@ -570,13 +611,27 @@ class OpenModelDB:
                 shutil.copyfileobj(src, dst)
             return out_path
 
+        def _write_and_verify(zf, info):
+            """Extract *info* and verify it against the resource's sha256.
+
+            The API's hash covers the model file itself, so it applies to the
+            resource's own entry (not to sibling files like a pre-built ONNX).
+            On mismatch the extracted file and the archive are removed: the
+            download was corrupted or tampered with.
+            """
+            out_path = _write(zf, info)
+            if expected_sha:
+                try:
+                    verify_sha256(out_path, expected_sha)
+                except DownloadError:
+                    self._cleanup(out_path, zip_path)
+                    raise
+            return out_path
+
         with zipfile.ZipFile(zip_path) as zf:
             entries = [i for i in zf.infolist() if not i.is_dir()]
 
             if target_ext is not None:
-                # Looking for a sibling file (e.g. .onnx next to .pth).
-                # Find the resource file by size to get its stem, then
-                # look for stem + target_ext.
                 target_ext = target_ext.lower()
                 stem = None
                 if expected_size:
@@ -591,24 +646,24 @@ class OpenModelDB:
                         if fstem == stem and fext.lower() == target_ext:
                             return _write(zf, info)
                 return None
-
-            # Normal extraction: match by size → extension → first file
+            
             if expected_size:
                 for info in entries:
                     if info.file_size == expected_size:
-                        return _write(zf, info)
+                        return _write_and_verify(zf, info)
 
             for info in entries:
                 if os.path.basename(info.filename).lower().endswith(expected_ext):
-                    return _write(zf, info)
+                    return _write_and_verify(zf, info)
 
             if entries:
-                return _write(zf, entries[0])
+                return _write_and_verify(zf, entries[0])
 
         raise DownloadError(f"No model file found inside {os.path.basename(zip_path)}")
 
     def _extract_all_from_zip(
         self, zip_path: str, dest_dir: str, ext_filter: str | None = None,
+        res: dict | None = None,
     ) -> list[str]:
         """Extract all model files from a zip archive.
 
@@ -616,6 +671,9 @@ class OpenModelDB:
             zip_path: Path to the zip file.
             dest_dir: Directory to write extracted files.
             ext_filter: If set (e.g. ".onnx"), only extract files with this extension.
+            res: Resource dict. When it carries a ``sha256``/``size``, the
+                extracted entry matching that size is verified against the
+                hash; a mismatch removes every extracted file and raises.
 
         Returns:
             List of paths to extracted files.
@@ -623,9 +681,16 @@ class OpenModelDB:
         import shutil
         import zipfile
 
+        from openmodeldb.downloader import sha256_of_file
+
         MODEL_EXTS = {".pth", ".safetensors", ".onnx", ".pt", ".bin", ".ckpt"}
+        expected_sha = (res or {}).get("sha256")
+        expected_size = (res or {}).get("size")
         paths = []
         os.makedirs(dest_dir, exist_ok=True)
+        archive_size = os.path.getsize(zip_path)
+        expansion_limit = _zip_expansion_limit(archive_size)
+        written = 0
 
         with zipfile.ZipFile(zip_path) as zf:
             for info in zf.infolist():
@@ -641,10 +706,37 @@ class OpenModelDB:
                 elif fext not in MODEL_EXTS:
                     continue
 
+                if written + info.file_size > expansion_limit:
+                    self._cleanup(*paths, zip_path)
+                    raise DownloadError(
+                        f"Refusing to extract {name} ({info.file_size} bytes, "
+                        f"{written} already extracted) from "
+                        f"{os.path.basename(zip_path)} "
+                        f"({archive_size} bytes): exceeds "
+                        f"expansion limit {expansion_limit} bytes "
+                        f"(possible zip bomb)."
+                    )
+
                 out_path = os.path.join(dest_dir, name)
                 with zf.open(info) as src, open(out_path, "wb") as dst:
                     shutil.copyfileobj(src, dst)
                 paths.append(out_path)
+                written += info.file_size
+
+                if (
+                    expected_sha
+                    and expected_size is not None
+                    and info.file_size == expected_size
+                ):
+                    actual = sha256_of_file(out_path)
+                    if actual != expected_sha.lower():
+                        self._cleanup(*paths, zip_path)
+                        raise DownloadError(
+                            f"SHA-256 mismatch for extracted {name}: expected "
+                            f"{expected_sha.lower()}, got {actual}. The archive "
+                            f"may be corrupted or tampered with; extracted "
+                            f"files have been removed."
+                        )
 
         return paths
 
@@ -658,19 +750,36 @@ class OpenModelDB:
                 f"({model.architecture}, {model.scale}x) [{file_ext}{extra}]"
             )
 
-    def _download_to_cache(self, url: str, file_name: str, quiet: bool = False) -> str:
-        """Download *url* into ``self._cache_dir`` unless already cached.
+    def _download_to_cache(
+        self, url: str, file_name: str, res: dict | None = None, quiet: bool = False,
+    ) -> str:
+        """Download *url* into ``self._cache_dir`` unless a valid copy is cached.
 
         Returns the path to the cached file. Prints the 'Using cached ...'
         line when a previously-downloaded copy is reused.
+
+        When the resource carries a ``sha256`` (over the model file itself,
+        not a zip container) cached copies are revalidated against it: a
+        stale or poisoned entry is discarded and re-fetched, and fresh
+        downloads are verified before being returned.
         """
-        from openmodeldb.downloader import smart_download
+        from openmodeldb.downloader import sha256_of_file, smart_download, verify_sha256
 
         cache_path = os.path.join(self._cache_dir, file_name)
-        if not os.path.exists(cache_path):
-            smart_download(url, cache_path, quiet=quiet)
-        elif not quiet:
-            print(f"  Using cached \033[2m{cache_path}\033[0m")
+        sha = (res or {}).get("sha256")
+        verifiable = bool(sha) and not self._is_zip_url(url)
+
+        if os.path.exists(cache_path):
+            if verifiable and sha is not None and sha256_of_file(cache_path) != sha.lower():
+                self._cleanup(cache_path)
+            else:
+                if not quiet:
+                    print(f"  Using cached \033[2m{cache_path}\033[0m")
+                return cache_path
+
+        smart_download(url, cache_path, quiet=quiet)
+        if verifiable and sha is not None:
+            verify_sha256(cache_path, sha)
         return cache_path
 
     def _cleanup(self, *paths: str) -> None:
@@ -693,20 +802,30 @@ class OpenModelDB:
         Download a model file.
 
         Args:
-            model: The Model to download, or a model name/id string.
-            dest: Destination directory (default: ./downloads/).
-            format: File format to download ('pth', 'safetensors', 'onnx').
-                    If 'onnx' is requested but not available, downloads
-                    a PyTorch format and converts automatically.
-            quiet: If True, download silently (no prints or progress bar).
-            half: If True and converting to ONNX, export in FP16 instead of FP32.
+            model: 
+                The Model to download, or a model name/id string.
+            dest: 
+                Destination directory (default: ./downloads/).
+            format: 
+                File format to download ('pth', 'safetensors', 'onnx').
+                If 'onnx' is requested but not available, downloads
+                a PyTorch format and converts automatically.
+            quiet: 
+                If True, download silently (no prints or progress bar).
+            half: 
+                If True and converting to ONNX, export in FP16 instead of FP32.
 
         Returns:
             Path to the downloaded file.
         """
-        from openmodeldb.downloader import build_filename, pick_best_url, smart_download
+        from openmodeldb.downloader import (
+            build_filename,
+            pick_best_url,
+            safe_filename_component,
+            smart_download,
+            verify_sha256,
+        )
 
-        # Resolve string to Model
         if isinstance(model, str):
             model = self._resolve_model(model)
 
@@ -722,7 +841,6 @@ class OpenModelDB:
                 res = self._find_convertible_resource(model)
                 need_onnx_convert = True
             elif fmt_lower in ("pth", "safetensors"):
-                # Try to find the other PyTorch format and convert
                 other = "safetensors" if fmt_lower == "pth" else "pth"
                 try:
                     res = self._find_resource(model, other)
@@ -743,9 +861,7 @@ class OpenModelDB:
 
         if need_onnx_convert:
             self._print_downloading(model, file_ext, quiet=quiet)
-            cache_path = self._download_to_cache(dl_url, file_name, quiet=quiet)
-
-            # If zip, try to find a pre-built ONNX inside first
+            cache_path = self._download_to_cache(dl_url, file_name, res=res, quiet=quiet)
             if is_zip:
                 onnx_from_zip = self._extract_from_zip(cache_path, res, dest_dir, target_ext=".onnx")
                 if onnx_from_zip:
@@ -755,15 +871,13 @@ class OpenModelDB:
                         print(f"  \033[92m✓\033[0m Extracted \033[2m{onnx_from_zip}\033[0m ({size_mb:.1f} MB)\n")
                     return onnx_from_zip
 
-                # No ONNX in archive, extract source model for conversion
                 if not quiet:
                     print(f"  No ONNX in archive, converting from {file_ext}...")
                 model_path = self._extract_from_zip(cache_path, res, self._cache_dir)
             else:
                 model_path = cache_path
 
-            # Build ONNX output path
-            onnx_name = model.id
+            onnx_name = safe_filename_component(model.id)
             onnx_path = os.path.join(dest_dir, f"{onnx_name}.onnx")
 
             if os.path.exists(onnx_path):
@@ -775,7 +889,6 @@ class OpenModelDB:
                     )
                 return onnx_path
 
-            # Convert to ONNX
             from openmodeldb.converter import convert_to_onnx
 
             onnx_path = convert_to_onnx(
@@ -792,9 +905,10 @@ class OpenModelDB:
             return onnx_path
 
         if need_format_convert:
+            assert format is not None  # need_format_convert implies a format was requested
             fmt_lower = format.lower().lstrip(".")
             self._print_downloading(model, file_ext, extra=f" → {fmt_lower}", quiet=quiet)
-            cache_path = self._download_to_cache(dl_url, file_name, quiet=quiet)
+            cache_path = self._download_to_cache(dl_url, file_name, res=res, quiet=quiet)
 
             if is_zip:
                 model_path = self._extract_from_zip(cache_path, res, self._cache_dir)
@@ -802,7 +916,7 @@ class OpenModelDB:
                 model_path = cache_path
 
             # Build output path
-            out_name = f"{model.id}.{fmt_lower}"
+            out_name = f"{safe_filename_component(model.id)}.{fmt_lower}"
             out_path = os.path.join(dest_dir, out_name)
 
             if os.path.exists(out_path):
@@ -827,17 +941,14 @@ class OpenModelDB:
                 print()
             return out_path
 
-        # Normal (non-convert) download
         if is_zip:
-            # Download zip to cache, extract the model to dest
             self._print_downloading(model, file_ext, quiet=quiet)
-            cache_path = self._download_to_cache(dl_url, file_name, quiet=quiet)
+            cache_path = self._download_to_cache(dl_url, file_name, res=res, quiet=quiet)
 
             if not quiet:
                 print("  Extracting from archive...")
             file_path = self._extract_from_zip(cache_path, res, dest_dir)
 
-            # Clean up the zip
             self._cleanup(cache_path)
 
             if os.path.exists(file_path):
@@ -854,6 +965,8 @@ class OpenModelDB:
 
         self._print_downloading(model, file_ext, quiet=quiet)
         smart_download(dl_url, file_path, quiet=quiet)
+        if res.get("sha256"):
+            verify_sha256(file_path, res["sha256"])
         if not quiet:
             print(f"  \033[92m✓\033[0m Saved to \033[2m{file_path}\033[0m\n")
         return file_path
@@ -872,10 +985,14 @@ class OpenModelDB:
         Use ``format`` to filter by extension (e.g. ``"onnx"``).
 
         Args:
-            model: The Model or a model name/id string.
-            dest: Destination directory (default: ./downloads/).
-            format: Only extract files with this extension (e.g. "onnx", "pth").
-            quiet: If True, suppress output.
+            model: 
+                The Model or a model name/id string.
+            dest: 
+                Destination directory (default: ./downloads/).
+            format: 
+                Only extract files with this extension (e.g. "onnx", "pth").
+            quiet: 
+                If True, suppress output.
 
         Returns:
             List of paths to downloaded/extracted files.
@@ -904,7 +1021,6 @@ class OpenModelDB:
             file_name = build_filename(dl_url, model.id, file_ext)
 
             if self._is_zip_url(dl_url):
-                # Download zip to cache, extract all (or filtered) model files
                 cache_path = os.path.join(self._cache_dir, file_name)
 
                 if not quiet:
@@ -917,13 +1033,14 @@ class OpenModelDB:
                 if not quiet:
                     print("  Extracting from archive...")
 
-                extracted = self._extract_all_from_zip(cache_path, dest_dir, ext_filter)
-                all_paths.extend(extracted)
-
                 try:
-                    os.remove(cache_path)
-                except OSError:
-                    pass
+                    extracted = self._extract_all_from_zip(cache_path, dest_dir, ext_filter, res)
+                finally:
+                    try:
+                        os.remove(cache_path)
+                    except OSError:
+                        pass
+                all_paths.extend(extracted)
 
                 if not quiet:
                     for p in extracted:
@@ -931,7 +1048,6 @@ class OpenModelDB:
                         print(f"  \033[92m✓\033[0m \033[2m{os.path.basename(p)}\033[0m ({size_mb:.1f} MB)")
                     print()
             else:
-                # Non-zip: respect ext_filter
                 if ext_filter and not file_name.lower().endswith(ext_filter):
                     continue
                 all_paths.append(self.download(model, dest=dest, format=file_ext, quiet=quiet))
@@ -966,30 +1082,25 @@ class OpenModelDB:
             raise FileNotFoundError(file_path)
 
         from openmodeldb.converter import compare_weights
-        from openmodeldb.downloader import build_filename, pick_best_url, smart_download
+        from openmodeldb.downloader import build_filename, pick_best_url, smart_download, verify_sha256
 
         basename = os.path.basename(file_path)
         stem = os.path.splitext(basename)[0]
 
-        # Resolve model from filename
         model = self._resolve_model(stem)
 
-        # Pick the best resource to use as reference
         local_ext = os.path.splitext(basename)[1].lower().lstrip(".")
         ref_res = None
-        # Prefer same format
         for res in model.resources:
             if res.get("type", "pth").lower() == local_ext:
                 ref_res = res
                 break
-        # Fallback to any non-zip resource
         if ref_res is None:
             for res in model.resources:
                 urls = res.get("urls", [])
                 if urls and not self._is_zip_url(pick_best_url(urls)):
                     ref_res = res
                     break
-        # Fallback to first resource with URLs
         if ref_res is None:
             for res in model.resources:
                 if res.get("urls"):
@@ -1010,13 +1121,13 @@ class OpenModelDB:
         if not quiet:
             print(f"  Checking \033[1m{model.name}\033[0m integrity...")
 
-        # Download reference to cache
         if not os.path.exists(ref_path):
             smart_download(dl_url, ref_path, quiet=quiet)
+            if not is_zip and ref_res.get("sha256"):
+                verify_sha256(ref_path, ref_res["sha256"])
         elif not quiet:
             print(f"  Using cached \033[2m{ref_path}\033[0m")
 
-        # If zip, extract
         if is_zip:
             extracted = self._extract_from_zip(ref_path, ref_res, self._cache_dir)
             try:
@@ -1025,16 +1136,13 @@ class OpenModelDB:
                 pass
             ref_path = extracted
 
-        # Compare
         result = compare_weights(file_path, ref_path, quiet=quiet)
 
-        # Clean up
         try:
             os.remove(ref_path)
         except OSError:
             pass
 
-        # Print results
         if not quiet:
             sim = result["similarity"]
             status = "\033[92m✓ PASS\033[0m" if result["identical"] else (

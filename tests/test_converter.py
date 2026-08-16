@@ -5,16 +5,17 @@ Skips cleanly (module-level) when the `convert` extras (torch, safetensors)
 are not installed, since compare_weights/convert_format/convert_to_onnx all
 require them.
 """
-import argparse
+import os
 
 import pytest
 
 torch = pytest.importorskip("torch")
 safetensors = pytest.importorskip("safetensors")
 
-from safetensors.torch import save_file  # noqa: E402
+from safetensors.torch import save_file
 
-from openmodeldb.converter import compare_weights  # noqa: E402
+from openmodeldb.converter import compare_weights, convert_format
+from openmodeldb.exceptions import OpenModelDBError, UnsafeModelError
 
 
 def _save_state_dict(path, state_dict):
@@ -48,7 +49,7 @@ def test_compare_weights_perturbed_copy(tmp_path):
     state_dict = {
         "a": torch.ones(4, 4),
         "b": torch.full((3,), 2.0),
-        "c": torch.arange(10, dtype=torch.float32) + 1.0,  # avoid zeros
+        "c": torch.arange(10, dtype=torch.float32) + 1.0,
     }
     perturbed = {k: v + 0.1 for k, v in state_dict.items()}
 
@@ -84,40 +85,90 @@ def test_compare_weights_scale_invariance(tmp_path):
 
     result = compare_weights(path_a, path_b, quiet=True)
 
-    # rel = mean(|1e-4 - (-1e-4)|) / (mean(|-1e-4|) + 1e-12) = 2e-4/1e-4 = 2.0
-    # similarity = max(0, 100*(1-2.0)) = 0.0
     assert result["similarity"] < 50.0
     assert result["identical"] is False
 
 
-# ─── unsafe pickle load warning ────────────────────────────────────────
+# ─── unsafe pickle refusal (no weights_only=False fallback) ────────────
 
-def test_compare_weights_warns_on_unsafe_pickle_fallback(tmp_path, monkeypatch):
-    # Payload contains a non-tensor object (argparse.Namespace) nested under
-    # a known state-dict key so it gets unwrapped before comparison, but the
-    # actual weights_only=True/False split is simulated deterministically
-    # via monkeypatch (real torch's weights_only allow-list varies by
-    # version, so this keeps the test stable).
-    path_a = str(tmp_path / "a.pth")
-    path_b = str(tmp_path / "b.pth")
-    payload = {
-        "cfg": argparse.Namespace(foo="bar"),
-        "model": {"w": torch.ones(2, 2)},
-    }
-    torch.save(payload, path_a)
-    torch.save(payload, path_b)
-
+def _make_load_fail_once(monkeypatch):
+    """Patch torch.load so the weights_only=True attempt fails, and record
+    every call's weights_only value (to prove no unsafe retry happens)."""
     real_load = torch.load
+    calls = []
 
     def _fake_load(path, *args, **kwargs):
-        if kwargs.get("weights_only", False):
+        calls.append(kwargs.get("weights_only"))
+        if kwargs.get("weights_only"):
             raise RuntimeError("simulated weights_only failure")
         kwargs["weights_only"] = False
         return real_load(path, *args, **kwargs)
 
     monkeypatch.setattr(torch, "load", _fake_load)
+    return calls
 
-    with pytest.warns(UserWarning, match="unsafe pickle load"):
-        result = compare_weights(path_a, path_b, quiet=True)
 
-    assert result["identical"] is True
+def test_compare_weights_refuses_unsafe_pickle(tmp_path, monkeypatch):
+    path_a = str(tmp_path / "a.pth")
+    path_b = str(tmp_path / "b.pth")
+    torch.save({"model": {"w": torch.ones(2, 2)}}, path_a)
+    torch.save({"model": {"w": torch.ones(2, 2)}}, path_b)
+
+    calls = _make_load_fail_once(monkeypatch)
+
+    with pytest.raises(UnsafeModelError, match="weights_only"):
+        compare_weights(path_a, path_b, quiet=True)
+
+    assert calls == [True]
+
+
+def test_convert_format_refuses_unsafe_pickle(tmp_path, monkeypatch):
+    src = str(tmp_path / "src.pth")
+    out = str(tmp_path / "out.safetensors")
+    torch.save({"model": {"w": torch.ones(2, 2)}}, src)
+
+    calls = _make_load_fail_once(monkeypatch)
+
+    with pytest.raises(UnsafeModelError, match="weights_only"):
+        convert_format(src, output_path=out, quiet=True)
+
+    assert calls == [True]
+
+    assert not os.path.exists(out)
+
+
+def test_unsafe_model_error_is_openmodeldb_error():
+    assert issubclass(UnsafeModelError, OpenModelDBError)
+
+
+# ─── torch version safety check (CVE-2025-32434) ──────────────────────
+
+def _tiny_pth(tmp_path):
+    path = str(tmp_path / "tiny.pth")
+    torch.save({"w": torch.ones(2, 2)}, path)
+    return path
+
+
+def test_warns_on_torch_below_2_6(tmp_path, monkeypatch, recwarn):
+    monkeypatch.setattr(torch, "__version__", "2.5.1", raising=False)
+
+    convert_format(_tiny_pth(tmp_path), output_path=str(tmp_path / "o.st"), quiet=True)
+
+    assert any("CVE-2025-32434" in str(w.message) for w in recwarn.list)
+
+
+def test_no_cve_warning_on_torch_2_6_plus(tmp_path, monkeypatch, recwarn):
+    monkeypatch.setattr(torch, "__version__", "2.6.0", raising=False)
+
+    convert_format(_tiny_pth(tmp_path), output_path=str(tmp_path / "o.st"), quiet=True)
+
+    assert not any("CVE-2025-32434" in str(w.message) for w in recwarn.list)
+
+
+def test_compare_weights_also_warns_on_old_torch(tmp_path, monkeypatch, recwarn):
+    monkeypatch.setattr(torch, "__version__", "2.0.1+cpu", raising=False)
+
+    path = _tiny_pth(tmp_path)
+    compare_weights(path, path, quiet=True)
+
+    assert any("CVE-2025-32434" in str(w.message) for w in recwarn.list)

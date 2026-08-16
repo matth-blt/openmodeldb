@@ -16,6 +16,7 @@ from openmodeldb.client import (
     ModelNotFoundError,
     OpenModelDB,
     OpenModelDBError,
+    UnsafeModelError,
 )
 
 __all__ = [
@@ -25,5 +26,6 @@ __all__ = [
     "ModelNotFoundError",
     "FormatNotFoundError",
     "DownloadError",
+    "UnsafeModelError",
 ]
 __version__ = "1.2.0"

@@ -12,7 +12,8 @@
         "platform": "pytorch",
         "type": "pth",
         "size": 12345678,
-        "urls": ["https://github.com/alice/example/releases/download/v1/examplenet.pth"]
+        "urls": ["https://github.com/alice/example/releases/download/v1/examplenet.pth"],
+        "sha256": "c29511cc74420dc700cafc716d0507339d61fa74ba6371e8765ab1a50feb7786"
       }
     ]
   },
@@ -29,7 +30,8 @@
         "platform": "pytorch",
         "type": "safetensors",
         "size": 5000000,
-        "urls": ["https://huggingface.co/bob/safeonly/resolve/main/safeonly.safetensors"]
+        "urls": ["https://huggingface.co/bob/safeonly/resolve/main/safeonly.safetensors"],
+        "sha256": "c29511cc74420dc700cafc716d0507339d61fa74ba6371e8765ab1a50feb7786"
       }
     ]
   },
@@ -46,13 +48,15 @@
         "platform": "pytorch",
         "type": "onnx",
         "size": 2000000,
-        "urls": ["https://huggingface.co/carol/dual/resolve/main/dual.onnx"]
+        "urls": ["https://huggingface.co/carol/dual/resolve/main/dual.onnx"],
+        "sha256": "c29511cc74420dc700cafc716d0507339d61fa74ba6371e8765ab1a50feb7786"
       },
       {
         "platform": "pytorch",
         "type": "pth",
         "size": 4000000,
-        "urls": ["https://huggingface.co/carol/dual/resolve/main/dual.pth"]
+        "urls": ["https://huggingface.co/carol/dual/resolve/main/dual.pth"],
+        "sha256": "c29511cc74420dc700cafc716d0507339d61fa74ba6371e8765ab1a50feb7786"
       }
     ]
   },
@@ -68,8 +72,9 @@
       {
         "platform": "pytorch",
         "type": "pth",
-        "size": 9999999,
-        "urls": ["https://github.com/dave/ziparchive/releases/download/v1/ziparchive.zip"]
+        "size": 16,
+        "urls": ["https://github.com/dave/ziparchive/releases/download/v1/ziparchive.zip"],
+        "sha256": "81fa91346f9206f06bc4cfacbdae4b4c8444b747c2ec3b0816b694e3567e26f7"
       }
     ]
   },
@@ -86,7 +91,8 @@
         "platform": "pytorch",
         "type": "pth",
         "size": 1234567,
-        "urls": ["https://huggingface.co/erin/listauthor/resolve/main/listauthor.pth"]
+        "urls": ["https://huggingface.co/erin/listauthor/resolve/main/listauthor.pth"],
+        "sha256": "c29511cc74420dc700cafc716d0507339d61fa74ba6371e8765ab1a50feb7786"
       }
     ]
   },

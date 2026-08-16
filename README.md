@@ -12,6 +12,19 @@ Browse and download AI upscaling models from [OpenModelDB](https://openmodeldb.i
 - **Convert** — automatic pth ↔ safetensors ↔ ONNX conversion when the requested format isn't published
 - **Verify** — compare a local file's weights against the database reference
 
+## Security model
+
+Model files are third-party artifacts: treat them like untrusted code.
+
+- Every download is checked against the database's SHA-256 when available;
+  a mismatch is treated as tampering and the file is deleted.
+- `.pth` files are pickles. They are loaded with `weights_only=True` (no
+  unsafe fallback), and conversion requires `torch>=2.6` (CVE-2025-32434).
+- Only `http`/`https` URLs are fetched, and links scraped from Google Drive
+  or MediaFire pages must stay on their expected host.
+- If you do not trust the source, download and load models inside an
+  isolated environment (container, VM).
+
 ## Install
 
 ```bash
@@ -21,12 +34,12 @@ pip install openmodeldb
 ## CLI
 
 ```bash
-openmodeldb                    # interactive: select scale → pick a model → download
+openmodeldb # interactive: select scale → pick a model → download
 
 openmodeldb list [--scale N] [--arch ARCH] [--tag TAG]
 openmodeldb search QUERY
 openmodeldb download NAME [--format FMT] [--dest DIR] [--half] [--all]
-openmodeldb check FILE         # verify a local file against the reference
+openmodeldb check FILE # verify a local file against the reference
 openmodeldb --version
 ```
 
@@ -60,7 +73,7 @@ db.download("4xNomos8k_atd_jpg", format="safetensors")
 # Auto-conversion between pth and safetensors
 # If the requested format is unavailable, downloads the other and converts
 db.download("2x-HFA2kAVCCompact", format="safetensors")  # only pth available → auto-convert
-db.download("1x-SuperScale", format="pth")                # only safetensors → auto-convert
+db.download("1x-SuperScale", format="pth") # only safetensors → auto-convert
 
 # Download as ONNX with auto-conversion
 # If no ONNX file is available, downloads .pth/.safetensors and converts automatically
@@ -69,7 +82,7 @@ db.download("2x-DigitalFlim-SuperUltraCompact", format="onnx", half=True)  # FP1
 
 # Download all available formats
 db.download_all("4xNomos8k_atd_jpg")
-db.download_all("4xNomos8k_atd_jpg", format="pth")  # only .pth files
+db.download_all("4xNomos8k_atd_jpg", format="pth") # only .pth files
 
 # Verify model integrity (compare weights against database reference)
 db.test_integrity("downloads/4xNomos8k_atd_jpg.pth")
@@ -90,8 +103,8 @@ print(model.name, model.author, model.scale, model.architecture)
 "4xNomos8k" in db  # True
 
 # Browse architectures and tags
-db.architectures()  # ['atd', 'compact', 'cugan', 'dat', ...]
-db.tags()           # ['anime', 'denoise', 'photo', ...]
+db.architectures() # ['atd', 'compact', 'cugan', 'dat', ...]
+db.tags() # ['anime', 'denoise', 'photo', ...]
 
 # Iterate
 for model in db:
@@ -105,17 +118,17 @@ db.interactive()
 
 ```python
 db = OpenModelDB(
-    cache_dir="/path/to/cache",   # model index + temp files (default: ~/.cache/openmodeldb)
-    download_dir="./my_models",   # default destination for downloads (default: ./downloads)
-    include_all=True,             # include archs excluded by default (cain, cain-yuv)
+    cache_dir="/path/to/cache", # model index + temp files (default: ~/.cache/openmodeldb)
+    download_dir="./my_models", # default destination for downloads (default: ./downloads)
+    include_all=True, # include archs excluded by default (cain, cain-yuv)
 )
 
-db.download_dir      # resolved download directory
-db.cache_dir         # resolved cache directory
-db.cache_is_valid()  # True if the cached index is fresh (< 1 hour)
+db.download_dir # resolved download directory
+db.cache_dir # resolved cache directory
+db.cache_is_valid() # True if the cached index is fresh (< 1 hour)
 
-db.refresh()      # force re-fetch of the model index from the API
-db.clear_cache()  # delete the cached index
+db.refresh() # force re-fetch of the model index from the API
+db.clear_cache() # delete the cached index
 ```
 
 The model index is cached for 1 hour (with ETag revalidation). If the API is
@@ -127,10 +140,10 @@ All errors inherit from `OpenModelDBError`:
 
 ```python
 from openmodeldb import (
-    OpenModelDBError,      # base — also raised when the API is unreachable with no cache
-    ModelNotFoundError,    # unknown or ambiguous model name
-    FormatNotFoundError,   # requested format unavailable (and not convertible)
-    DownloadError,         # network/host failure during download
+    OpenModelDBError, # base — also raised when the API is unreachable with no cache
+    ModelNotFoundError, # unknown or ambiguous model name
+    FormatNotFoundError, # requested format unavailable (and not convertible)
+    DownloadError, # network/host failure during download
 )
 
 try:
@@ -148,7 +161,7 @@ the candidates.
 - [InquirerPy](https://github.com/kazhala/InquirerPy) — interactive prompts
 - [rich](https://github.com/Textualize/rich) — progress bars and tables
 - [pycryptodome](https://github.com/Legrandin/pycryptodome) — Mega.nz decryption
-- [mediafiredl](https://github.com/Gann4/mediafiredl) — MediaFire direct-link extraction
+- MediaFire direct-link extraction — built in (bounded-timeout scraper, no third-party dependency)
 
 ### Conversion (optional)
 
@@ -171,8 +184,8 @@ git clone https://github.com/matth-blt/openmodeldb
 cd openmodeldb
 pip install -e .[dev]
 
-python -m pytest tests/ -q   # run the test suite (offline, no network needed)
-ruff check .                 # lint
+python -m pytest tests/ -q # run the test suite (offline, no network needed)
+ruff check . # lint
 ```
 
 Tests covering format conversion require the `convert` extras

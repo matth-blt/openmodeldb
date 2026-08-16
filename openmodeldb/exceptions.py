@@ -21,3 +21,12 @@ class FormatNotFoundError(OpenModelDBError):
 
 class DownloadError(OpenModelDBError):
     """Raised when a download fails."""
+
+
+class UnsafeModelError(OpenModelDBError):
+    """Raised when a model file cannot be loaded safely.
+
+    Covers pickles that require ``weights_only=False`` to load — a mode that
+    executes arbitrary code during deserialization. The library refuses to
+    fall back to it automatically.
+    """
