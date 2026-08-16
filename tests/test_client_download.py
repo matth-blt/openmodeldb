@@ -233,7 +233,12 @@ def test_download_format_convert_sanitizes_traversal_model_id(db, monkeypatch):
 
     monkeypatch.setattr("openmodeldb.downloader.smart_download", _fake)
 
-    def _fake_convert(model_path: str, output_path: str | None = None, target: str = "safetensors", quiet: bool = False):
+    def _fake_convert(
+        model_path: str,
+        output_path: str | None = None,
+        target: str = "safetensors",
+        quiet: bool = False,
+    ):
         assert output_path is not None
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         with open(output_path, "wb") as f:

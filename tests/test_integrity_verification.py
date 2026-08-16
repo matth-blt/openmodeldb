@@ -143,7 +143,12 @@ def test_cached_file_with_wrong_sha_is_redownloaded(db, monkeypatch, tmp_path):
     with open(cache_file, "wb") as f:
         f.write(b"stale-or-poisoned-bytes")
 
-    def _fake_convert(model_path: str, output_path: str | None = None, target: str = "safetensors", quiet: bool = False):
+    def _fake_convert(
+        model_path: str,
+        output_path: str | None = None,
+        target: str = "safetensors",
+        quiet: bool = False,
+    ):
         assert output_path is not None
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         with open(output_path, "wb") as f:
@@ -168,7 +173,12 @@ def test_cached_file_with_correct_sha_is_reused(db, monkeypatch):
     with open(cache_file, "wb") as f:
         f.write(DUMMY)
 
-    def _fake_convert(model_path: str, output_path: str | None = None, target: str = "safetensors", quiet: bool = False):
+    def _fake_convert(
+        model_path: str,
+        output_path: str | None = None,
+        target: str = "safetensors",
+        quiet: bool = False,
+    ):
         assert output_path is not None
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         with open(output_path, "wb") as f:
