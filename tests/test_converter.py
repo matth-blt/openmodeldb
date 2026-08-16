@@ -15,7 +15,7 @@ from openmodeldb.exceptions import OpenModelDBError, UnsafeModelError
 torch = pytest.importorskip("torch")
 safetensors = pytest.importorskip("safetensors")
 
-from safetensors.torch import save_file # noqa: E402
+from safetensors.torch import save_file  # noqa: E402
 
 
 def _save_state_dict(path, state_dict):
